@@ -4,6 +4,7 @@
 Record monitored data access patterns.
 """
 
+import argparse
 import json
 import os
 import signal
@@ -12,6 +13,7 @@ import time
 
 import _damo_fmt_str
 import _damo_records
+import _damo_subproc
 import _damon
 import _damon_args
 
@@ -66,11 +68,6 @@ def handle_args(args):
         if os.path.isfile(footprint_file_path):
             os.rename(footprint_file_path, footprint_file_path + '.old')
 
-    err = _damo_records.set_perf_path(args.perf_path)
-    if err != None:
-        print(err)
-        exit(-3)
-
 def tracepoints_from_args(args):
     if not 'access' in args.do_record or args.snapshot is not None:
         return None
@@ -101,9 +98,8 @@ def snapshot_requests_from_args(args):
     if err is not None:
         return None, err
 
-    return _damo_records.RecordGetRequest(
-            tried_regions_of=tried_regions_of, record_file=None,
-            snapshot_damos_filters=dfilters,
+    return _damo_records.SnapshotRequest(
+            tried_regions_of=tried_regions_of, snapshot_damos_filters=dfilters,
             record_filter=record_filter, total_sz_only=False,
             dont_merge_regions=False), None
 
@@ -121,8 +117,34 @@ def mk_handle(args, kdamonds, monitoring_intervals):
         snapshot_interval_sec = None
         snapshot_count = None
 
+    output_flush_sec = _damo_fmt_str.text_to_sec(args.output_flush_sec)
+
+    do_records = args.do_record
+    damon_tracer = args.damon_tracer
+    if damon_tracer is not None:
+        tracer = damon_tracer
+        if tracer == 'perf' and args.perf_path is not None:
+            tracer = args.perf_path
+        if not _damo_subproc.avail_cmd(tracer):
+            print('--damon_tracer (%s) is unavailable' % tracer)
+            cleanup_exit(1)
+    else:
+        perf_path = 'perf'
+        if args.perf_path is not None:
+            perf_path = args.perf_path
+        if _damo_subproc.avail_cmd(perf_path):
+            damon_tracer = 'perf'
+        elif _damo_subproc.avail_cmd('trace-cmd'):
+            damon_tracer = 'trace-cmd'
+            if 'cpu_profile' in do_records:
+                do_records.remove('cpu_profile')
+        else:
+            print('Please install trace-cmd or perf and retry')
+            cleanup_exit(1)
+
     handle = _damo_records.RecordingHandle(
             # for access pattern monitoring
+            damon_tracer=damon_tracer,
             tracepoints=tracepoints, file_path=args.out,
             file_format=args.output_type,
             file_permission=args.output_permission,
@@ -136,9 +158,23 @@ def mk_handle(args, kdamonds, monitoring_intervals):
             record_proc_stats='proc_stats' in args.do_record,
             timeout=args.timeout, snapshot_request=snapshot_request,
             snapshot_interval_sec=snapshot_interval_sec,
-            snapshot_count=snapshot_count)
+            snapshot_count=snapshot_count,
+            max_seconds_per_file=output_flush_sec)
+    if args.perf_path is not None:
+        err = handle.set_perf_path(args.perf_path)
+        if err is not None:
+            print('--perf_path handling fail (%s)' % err)
+            cleanup_exit(1)
 
     return handle
+
+def for_damon_stat_snapshot(args):
+    if args.snapshot is None:
+        return False
+    request, err = snapshot_requests_from_args(args)
+    if err is not None:
+        return False
+    return _damo_records.should_get_snapshot_from_damon_stat(request)
 
 def main(args):
     global data_for_cleanup
@@ -153,7 +189,23 @@ def main(args):
     signal.signal(signal.SIGTERM, sighandler)
 
     # Now the real works
-    if not _damon_args.is_ongoing_target(args):
+    if _damon_args.is_ongoing_target(args):
+        if not _damon.any_kdamond_running():
+            print('DAMON is not turned on')
+            exit(1)
+
+        # TODO: Support multiple kdamonds, multiple contexts
+        monitoring_intervals = data_for_cleanup.orig_kdamonds[
+                0].contexts[0].intervals
+        kdamonds = data_for_cleanup.orig_kdamonds
+    elif for_damon_stat_snapshot(args):
+        monitoring_intervals = _damon.DamonIntervals(
+                sample=5000, aggr=100000, ops_update=60000000,
+                intervals_goal= _damon.DamonIntervalsGoal(
+                    access_bp=400, aggrs=3, min_sample_us=5000,
+                    max_sample_us=10000000))
+        kdamonds = []
+    else:
         err, kdamonds = _damon_args.turn_damon_on(args)
         if err:
             print('could not turn DAMON on (%s)' % err)
@@ -164,15 +216,6 @@ def main(args):
         monitoring_intervals = kdamonds[0].contexts[0].intervals
         now_kdamonds = _damon.current_kdamonds()
         kdamonds[0].pid = now_kdamonds[0].pid
-    else:
-        if not _damon.any_kdamond_running():
-            print('DAMON is not turned on')
-            exit(1)
-
-        # TODO: Support multiple kdamonds, multiple contexts
-        monitoring_intervals = data_for_cleanup.orig_kdamonds[
-                0].contexts[0].intervals
-        kdamonds = data_for_cleanup.orig_kdamonds
 
     record_handle = mk_handle(args, kdamonds, monitoring_intervals)
 
@@ -191,8 +234,10 @@ def set_argparser(parser):
                         help='output file\'s type')
     parser.add_argument('--output_permission', type=str, default='600',
                         help='permission of the output file')
-    parser.add_argument('--perf_path', type=str, default='perf',
-                        help='path of perf tool ')
+    parser.add_argument(
+            '--output_flush_sec', type=str, default='3600',
+            help='intermediate output files flush duration in seconds')
+    parser.add_argument('--perf_path', type=str, help='path of perf tool')
     parser.add_argument('--exclude_child_tasks', action='store_false',
                         dest='include_child_tasks',
                         help='do not record access of child processes')
@@ -210,6 +255,11 @@ def set_argparser(parser):
                         choices=['access', 'cpu_profile', 'mem_footprint',
                                  'vmas', 'proc_stats'],
                         help='what to do record')
+    parser.add_argument('--damon_tracer', metavar='cmd',
+                        choices=['perf', 'trace-cmd'],
+                        # tracer to use.  Hide this as this is an experimental
+                        # option.
+                        help=argparse.SUPPRESS)
     _damo_records.set_snapshot_damos_filters_option(parser)
     _damo_records.set_filter_argparser(parser)
     return parser

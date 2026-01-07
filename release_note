@@ -1,6 +1,89 @@
 This file records important changes that made in each release.  Those are
 picked by human sense, so could be incomplete and missing many things.
 
+v3.1.0
+- damo report sysinfo: Support available DAMON modules listing.
+- Fix 5.15 kernel 'damo report access' breakage for None age.
+- Add more unit tests for trace output parsing.
+
+v3.0.9
+- Support 'perf' unavailable systems.
+  - Require 'trace-cmd' instead, for 'damo record'.
+
+v3.0.8
+- Add --sample_primitives option.
+
+v3.0.7
+- sysinfo: Support perf information.
+- sysinfo: Support <5.15 DAMON version inference.
+- Support 'damon sample control' feature.
+
+v3.0.6
+- damo report damon: Support yaml format with --format option.
+- Provide wrong memcg DAMOS filter error detail.
+- sysinfo: use git-based damo version if available.
+- Support nr_stats and max_nr_stats
+  (https://lore.kernel.org/20251123184329.85287-1-sj@kernel.org).
+
+v3.0.5
+- Fix a bug in 'damo report heatmap --interactive_edit'.
+- damo record: Support taking snapshots from DAMON_STAT.
+- Improve --include_child_tasks monitoring results inheritance on kernels not
+  supporting obsolete targets feature.
+- Cleanup damon feature check code.
+
+v3.0.4
+- Fix debugfs interface support bug that was introduced by v3.0.3.
+- damo report sysinfo: Support trace features.
+- More feature/sysinfo check cleanups.
+
+v3.0.3
+- damo report access: Add 'cold-memory-tail' and 'idle-memory-percentiles'
+  --style option.
+- Implement 'damo report sysinfo'.
+- Refactor DAMON features check system.
+
+v3.0.2
+- Improve monitoring results inheritance for --include_child_tasks use case, on
+  kernels supporting obsolete_target feature.
+- Introduce --obsolete_targets option for online DAMON parameter commit
+  commands.
+- Fix DAMON features check for allow_filter and hugepage_size.
+
+v3.0.1
+- Update damo record test be more time-error tolerant.
+- Add node_memcg_{used,free}bp DAMOS quota goal feature check.
+- Support obsolete_target sysfs file support.
+
+v3.0.0
+- Save record output per user-specified time interval (--output_flush_sec, one
+  hour by default).
+- Add record filter options to 'damo adjust' for splitting too huge record
+  files into multiple files.
+- Support node_memcg_{used,free}_bp DAMOS quota goal
+  (https://lore.kernel.org/20251009212042.60084-1-sj@kernel.org)
+
+v2.9.9
+- Fix lost targets bug on _damon.add_childs_target().
+- Clarify target regions inheritance behavior.
+- Support retrieving DAMON records from DAMON_STAT.
+
+v2.9.8
+- Fixup 'damo report holistic' breakage.
+- Avoid unnecessary DAMOS tried regions update in 'damo report damon --json'.
+- Add '--omit_damos_tried_regions' to 'damo report damon'.
+- Preparation of DAMON_STAT support on 'damo record' and 'damo report access'.
+
+v2.9.7
+- DAMOS arguments parsing cleanup.
+- Errors out on invalid number of --damos_action arguments.
+
+v2.9.6
+- Prepare DAMON_STAT integration into DAMON records.
+
+v2.9.5
+- Accelerate --include_child_tasks to be recursive
+
 v2.9.4
 - damo module stat: support transforming partial idle time percentiles to idle
   time-memory size visualization (--input_idle_time_percentiles).

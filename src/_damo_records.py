@@ -3,6 +3,7 @@
 import argparse
 import collections
 import copy
+import datetime
 import json
 import os
 import random
@@ -13,14 +14,120 @@ import zlib
 
 import _damo_fmt_str
 import _damo_subproc
+import _damo_sysinfo
 import _damon
 import _damon_args
 import damo_report_access
 
-PERF = 'perf'
+traceevent_damon_aggregated = 'damon_aggregated'
+traceevent_damon_monitor_intervals_tune = 'damon_monitor_intervals_tune'
+traceevent_damos_before_apply = 'damos_before_apply'
+
 perf_event_damon_aggregated = 'damon:damon_aggregated'
 perf_event_damon_monitor_intervals_tune = 'damon:damon_monitor_intervals_tune'
 perf_event_damos_before_apply = 'damon:damos_before_apply'
+
+class DamonIdleMsPercentile:
+    percentile = None
+    idle_ms = None
+
+    def __init__(self, percentile, idle_ms):
+        self.percentile = _damo_fmt_str.text_to_nr(percentile)
+        self.idle_ms = _damo_fmt_str.text_to_ms(idle_ms)
+
+    @classmethod
+    def from_kvpairs(cls, kv):
+        return DamonIdleMsPercentile(
+                percentile=kv['percentile'], idle_ms=kv['idle_ms'])
+
+    def to_kvpairs(self, raw=False):
+        return collections.OrderedDict([
+            ('percentile', _damo_fmt_str.format_nr(self.percentile, raw)),
+            ('idle_ms', _damo_fmt_str.format_time_ms_exact(self.idle_ms, raw)),
+            ])
+
+class DamonIdleMsPercentiles:
+    percentile_ms_list = None  # list of DamonIdleMsPercentile
+
+    def __init__(self, percentile_ms_list):
+        self.percentile_ms_list = percentile_ms_list
+
+    @classmethod
+    def from_kvpairs(cls, kv):
+        percentile_ms_list = [DamonIdleMsPercentile.from_kvpairs(x)
+                              for x in kv]
+        return DamonIdleMsPercentiles(percentile_ms_list=percentile_ms_list)
+
+    def to_kvpairs(self, raw=False):
+        return [x.to_kvpairs(raw) for x in self.percentile_ms_list]
+
+class DamonStatSnapshot:
+    idletime_ms_percentiles = None  # DamonIdleMsPercentiles
+    memory_bw_bytes_per_sec = None   # bytes per second
+    aggr_interval_us = None # aggregation interval, available from 6.18
+
+    def __init__(self, idletime_ms_percentiles,
+                 memory_bw_bytes_per_sec, aggr_interval_us):
+        self.idletime_ms_percentiles = idletime_ms_percentiles
+        self.memory_bw_bytes_per_sec = _damo_fmt_str.text_to_bytes(
+                memory_bw_bytes_per_sec)
+        # aggr_interval_us on DAMON_STAT is available since 6.18
+        if aggr_interval_us is not None:
+            self.aggr_interval_us = _damo_fmt_str.text_to_us(aggr_interval_us)
+
+    @classmethod
+    def from_kvpairs(cls, kv):
+        return DamonStatSnapshot(
+                idletime_ms_percentiles=DamonIdleMsPercentiles.from_kvpairs(
+                    kv['idletime_ms_percentiles']),
+                memory_bw_bytes_per_sec=kv['memory_bw_bytes_per_sec'],
+                aggr_interval_us=kv['aggr_interval_us'])
+
+    def to_kvpairs(self, raw=False):
+        if self.aggr_interval_us is not None:
+            aggr_interval_us = _damo_fmt_str.format_time_us_exact(
+                    self.aggr_interval_us, raw)
+        else:
+            aggr_interval_us = None
+
+        return collections.OrderedDict([
+            ('idletime_ms_percentiles',
+             self.idletime_ms_percentiles.to_kvpairs(raw)),
+            ('memory_bw_bytes_per_sec',
+             _damo_fmt_str.format_sz(self.memory_bw_bytes_per_sec, raw)),
+            ('aggr_interval_us', aggr_interval_us),
+            ])
+
+    @classmethod
+    def capture(cls, live_only=False):
+        damon_stat_parm_dir = '/sys/module/damon_stat/parameters'
+        if not os.path.isdir(damon_stat_parm_dir):
+            return None, 'damon_stat unsupported'
+        if live_only:
+            with open(os.path.join(damon_stat_parm_dir, 'enabled'), 'r') as f:
+                if f.read().strip().lower() == 'n':
+                    return None, 'damon_stat is not enabled'
+        with open(os.path.join(damon_stat_parm_dir,
+                               'memory_idle_ms_percentiles'), 'r') as f:
+            idletime_ms_percentiles = DamonIdleMsPercentiles(
+                    percentile_ms_list=[
+                        DamonIdleMsPercentile(percentile, idle_ms)
+                        for percentile, idle_ms in
+                        enumerate(f.read().strip().split(','))])
+        with open(os.path.join(damon_stat_parm_dir,
+                               'estimated_memory_bandwidth'), 'r') as f:
+            memory_bw_bytes_per_sec = int(f.read())
+        aggr_interval_file = os.path.join(damon_stat_parm_dir,
+                                          'aggr_interval_us')
+        if not os.path.isfile(aggr_interval_file):
+            aggr_interval_us = None
+        else:
+            with open(aggr_interval_file, 'r') as f:
+                aggr_interval_us = int(f.read())
+        return DamonStatSnapshot(
+                idletime_ms_percentiles=idletime_ms_percentiles,
+                memory_bw_bytes_per_sec=memory_bw_bytes_per_sec,
+                aggr_interval_us=aggr_interval_us), None
 
 class DamonSnapshot:
     '''
@@ -56,6 +163,7 @@ class DamonSnapshot:
         if 'sample_interval_us' in kv and kv['sample_interval_us'] is not None:
             sample_interval_us = _damo_fmt_str.text_to_us(
                     kv['sample_interval_us'])
+
         return DamonSnapshot(
                 _damo_fmt_str.text_to_ns(kv['start_time']),
                 _damo_fmt_str.text_to_ns(kv['end_time']),
@@ -85,6 +193,9 @@ class DamonSnapshot:
             ('sample_interval_us', sample_interval_us),
             ])
 
+record_data_source_unknown = 'unknown'
+record_data_source_damon_stat = 'damon_stat'
+
 class DamonRecord:
     '''
     Contains data access monitoring results for single target
@@ -96,9 +207,10 @@ class DamonRecord:
     target_id = None
     scheme_filters = None
     snapshots = None
+    data_source = None # source of data that used to generate this.
 
     def __init__(self, kd_idx, ctx_idx, intervals, scheme_idx, target_id,
-                 scheme_filters):
+                 scheme_filters, data_source=record_data_source_unknown):
         self.kdamond_idx = kd_idx
         self.context_idx = ctx_idx
         self.intervals = intervals
@@ -106,6 +218,7 @@ class DamonRecord:
         self.target_id = target_id
         self.scheme_filters = scheme_filters
         self.snapshots = []
+        self.data_source = data_source
 
     @classmethod
     def from_kvpairs(cls, kv):
@@ -115,6 +228,11 @@ class DamonRecord:
                 kv[keyword] = None
         if not 'scheme_filters' in kv:
             kv['scheme_filters'] = []
+        # data_source was introduced after v2.9.8
+        if not 'data_source' in kv:
+            data_source = record_data_source_unknown
+        else:
+            data_source = kv['data_source']
 
         record = DamonRecord(
                 kv['kdamond_idx'], kv['context_idx'],
@@ -122,7 +240,7 @@ class DamonRecord:
                 if kv['intervals'] is not None else None,
                 kv['scheme_idx'], kv['target_id'],
                 [_damon.DamosFilter.from_kvpairs(pairs) for pairs in
-                 kv['scheme_filters']])
+                 kv['scheme_filters']], data_source=data_source)
         record.snapshots = [DamonSnapshot.from_kvpairs(s)
                 for s in kv['snapshots']]
 
@@ -142,6 +260,7 @@ class DamonRecord:
         else:
             ordered_dict['scheme_filters'] = []
         ordered_dict['snapshots'] = [s.to_kvpairs(raw) for s in self.snapshots]
+        ordered_dict['data_source'] = self.data_source
         return ordered_dict
 
     def can_merge(self, other):
@@ -281,11 +400,11 @@ def record_of(target_id, records, intervals):
     records.append(record)
     return record
 
-def parse_damon_aggregated_perf_script_fields(fields):
+def parse_damon_trace_aggregated(fields):
     '''
-    The line is like below:
+    The fields is like below:
 
-    kdamond.0  4452 [000] 82877.315633: damon:damon_aggregated: \
+    82877.315633: damon:damon_aggregated: \
             target_id=18446623435582458880 nr_regions=17 \
             140731667070976-140731668037632: 0 3
 
@@ -294,17 +413,17 @@ def parse_damon_aggregated_perf_script_fields(fields):
     [1] https://lore.kernel.org/linux-mm/df8d52f1fb2f353a62ff34dc09fe99e32ca1f63f.1636610337.git.xhao@linux.alibaba.com/
     '''
 
-    if not len(fields) in [9, 10]:
+    if not len(fields) in [6, 7]:
         return None, None, None, None
 
-    end_time = int(float(fields[3][:-1]) * 1000000000)
-    target_id = int(fields[5].split('=')[1])
-    nr_regions = int(fields[6].split('=')[1])
+    end_time = int(float(fields[0][:-1]) * 1000000000)
+    target_id = int(fields[2].split('=')[1])
+    nr_regions = int(fields[3].split('=')[1])
 
-    start_addr, end_addr = [int(x) for x in fields[7][:-1].split('-')]
-    nr_accesses = int(fields[8])
-    if len(fields) == 10:
-        age = int(fields[9])
+    start_addr, end_addr = [int(x) for x in fields[4][:-1].split('-')]
+    nr_accesses = int(fields[5])
+    if len(fields) == 7:
+        age = int(fields[6])
     else:
         age = None
     region = _damon.DamonRegion(start_addr, end_addr, nr_accesses,
@@ -312,82 +431,109 @@ def parse_damon_aggregated_perf_script_fields(fields):
 
     return region, end_time, target_id, nr_regions
 
-def parse_damos_before_apply_perf_script_fields(fields):
+def parse_damos_trace_before_apply(fields):
     '''
-    The line is like below:
+    The fields would be in format of
 
-    kdamond.0  4452 [000] 82877.315633: damon:damon_aggregated: \
-            target_id=18446623435582458880 nr_regions=17 \
-            140731667070976-140731668037632: 0 3
-
-    Note that the last field is not in the early version[1].
-
-    line is like below for damos_before_apply:
-
-    kdamond.0 47293 [000] 80801.060214: damon:damos_before_apply: \
+    80801.060214: damon:damos_before_apply: \
             ctx_idx=0 scheme_idx=0 target_idx=0 nr_regions=11 \
             121932607488-135128711168: 0 136
-
-    [1] https://lore.kernel.org/linux-mm/df8d52f1fb2f353a62ff34dc09fe99e32ca1f63f.1636610337.git.xhao@linux.alibaba.com/
     '''
 
-    if len(fields) != 12:
+    if len(fields) != 9:
         return None, None, None, None
 
-    end_time = int(float(fields[3][:-1]) * 1000000000)
-    target_id = int(fields[7].split('=')[1])
-    nr_regions = int(fields[8].split('=')[1])
+    end_time = int(float(fields[0][:-1]) * 1000000000)
+    target_id = int(fields[4].split('=')[1])
+    nr_regions = int(fields[5].split('=')[1])
 
-    start_addr, end_addr = [int(x) for x in fields[9][:-1].split('-')]
-    nr_accesses = int(fields[10])
-    age = int(fields[11])
+    start_addr, end_addr = [int(x) for x in fields[6][:-1].split('-')]
+    nr_accesses = int(fields[7])
+    age = int(fields[8])
     region = _damon.DamonRegion(start_addr, end_addr, nr_accesses,
             _damon.unit_samples, age, _damon.unit_aggr_intervals)
 
     return region, end_time, target_id, nr_regions
 
-def parse_perf_script_line(line):
+def parse_damon_trace_region(fields):
     '''
-    line could be that for damon_aggregated or damos_before_apply events
+    fields could be that for damon_aggregated or damos_before_apply events
+
+    The fields would be in format of
+
+    <timestamp> <tracepoint name> ...
     '''
-    fields = line.strip().split()
-    if not len(fields) > 5:
+    if len(fields) < 2:
         return None, None, None, None
-    traceevent = fields[4][:-1]
-    if traceevent == perf_event_damon_aggregated:
-        return parse_damon_aggregated_perf_script_fields(fields)
-    elif traceevent == perf_event_damos_before_apply:
-        return parse_damos_before_apply_perf_script_fields(fields)
+    traceevent = fields[1][:-1]
+    if traceevent in [traceevent_damon_aggregated,
+                      perf_event_damon_aggregated]:
+        return parse_damon_trace_aggregated(fields)
+    elif traceevent in [traceevent_damos_before_apply,
+                        perf_event_damos_before_apply]:
+        return parse_damos_trace_before_apply(fields)
     else:
         return None, None, None, None
 
-def parse_perf_script_tune_line(line):
+def parse_damon_trace_intervals_tune(fields):
     '''
-    The line is in format of, e.g.,
-    35359.794 kdamond.0/57030 damon:damon_monitor_intervals_tune(sample_us: 100000)
+    Example fields:
+
+    ['92713.218210:', 'damon:damon_monitor_intervals_tune:', 'sample_us=80000']
 
     Return if the line is for damon_monitor_intervals_tune, and if so, the
     sample_us value.
      '''
+    if len(fields) != 3:
+        return False, None
+    tracepoint_name = fields[1][:-1]
+    if not tracepoint_name in [traceevent_damon_monitor_intervals_tune,
+                               perf_event_damon_monitor_intervals_tune]:
+        return False, None
+    return True, int(fields[2].split('=')[1])
 
+def damon_trace_fields(line):
+    '''
+    Receives a line from 'trace-cmd report' or 'perf script' outputs and return
+    fields starting from the timestamp (the fourth field).
+
+    In case of trace-cmd report, the format is like,
+
+           kdamond.0-264454 [007] ..... 92627.258073: damon_aggregated: \
+                   target_id=0 nr_regions=10 8255430656-8372879360: 0 1
+
+    In case of perf script, the format is like,
+
+            kthreadd  264573 [003] 93212.176071: damon:damon_aggregated: \
+                    target_id=0 nr_regions=4 6945607680-8372879360: 0 0
+
+    The format from the fourth field is identical for both cases, and hence a
+    single parsing logic can be used.
+    '''
     fields = line.split()
-    if len(fields) != 4:
-        return False, None
-    tracepoint_name = fields[2].split('(')[0]
-    if tracepoint_name != perf_event_damon_monitor_intervals_tune:
-        return False, None
-    return True, int(fields[3].split(')')[0])
+    if len(fields) < 4:
+        return None
+    return fields[3:]
 
-def parse_perf_script(script_output, monitoring_intervals):
+def parse_damon_trace(trace_text, monitoring_intervals):
+    '''
+    Parse DAMON tracepoints.  trace_text could be output of 'perf script' or
+    'trace-cmd report'.
+    '''
     records = []
     snapshot = None
     snapshot_sample_interval_us = None
 
-    for line in script_output.split('\n'):
-        parsed, snapshot_sample_interval_us = parse_perf_script_tune_line(line)
+    for line in trace_text.split('\n'):
+        fields = damon_trace_fields(line)
+        if fields is None:
+            continue
+        parsed, snapshot_sample_interval_us = parse_damon_trace_intervals_tune(
+                fields)
         if parsed is True:
             continue
-        region, end_time, target_id, nr_regions = parse_perf_script_line(line)
+        region, end_time, target_id, nr_regions = parse_damon_trace_region(
+                fields)
         if region is None:
             continue
 
@@ -418,23 +564,21 @@ def parse_perf_script(script_output, monitoring_intervals):
     set_first_snapshot_start_time(records)
     return records, None
 
-def set_perf_path(perf_path):
-    global PERF
-    PERF = perf_path
-
-    # Test perf record for damon event
-    err = None
-    if _damo_subproc.avail_cmd(PERF):
-        try:
-            subprocess.check_output(
-                    [PERF, 'record', '-e', perf_event_damon_aggregated, '--',
-                        'sleep', '0'],
-                    stderr=subprocess.PIPE)
-        except:
-            err = 'perf record not working with "%s"' % PERF
-    else:
-        err = 'perf not found at "%s"' % PERF
-    return err
+def parse_perf_damon_record(
+        record_file, monitoring_intervals, perf_cmd='perf'):
+    '''Returns DamonRecord list and error'''
+    try:
+        with open(os.devnull, 'w') as fnull:
+            # in some setup, perf record file ends up having no proper
+            # ownership.  There's no reason to be strict about that from
+            # damo.  As long as we can, just parse it with '--force'
+            # option.
+            perf_script_output = subprocess.check_output(
+                    [perf_cmd, 'script', '--force', '-i', record_file],
+                    stderr=fnull).decode()
+    except Exception as e:
+        return None, 'failed perf-script (%s)' % e
+    return parse_damon_trace(perf_script_output, monitoring_intervals)
 
 def parse_json(json_str):
     kvpairs = json.loads(json_str)
@@ -472,28 +616,13 @@ def parse_records_file(record_file, monitoring_intervals=None):
         except Exception as e:
             return None, 'failed parsing json compressed file (%s)' % e
 
-    perf_script_output = None
     if file_type == 'ASCII text':
         with open(record_file, 'r') as f:
             perf_script_output = f.read()
-    else:
-        # might be perf data
-        try:
-            with open(os.devnull, 'w') as fnull:
-                # in some setup, perf record file ends up having no proper
-                # ownership.  There's no reason to be strict about that from
-                # damo.  As long as we can, just parse it with '--force'
-                # option.
-                perf_script_output = subprocess.check_output(
-                        [PERF, 'script', '--force', '-i', record_file],
-                        stderr=fnull).decode()
-        except:
-            # Should be record format file
-            pass
-    if perf_script_output is not None:
-        return parse_perf_script(perf_script_output, monitoring_intervals)
-    else:
-        return None, 'parsing %s failed' % record_file
+        return parse_damon_trace(perf_script_output, monitoring_intervals)
+
+    return parse_perf_damon_record(
+            record_file, monitoring_intervals, perf_cmd='perf')
 
 # for writing monitoring results to a file
 
@@ -587,18 +716,34 @@ def write_damon_records(records, file_path, file_type, file_permission=None):
         os.chmod(file_path, file_permission)
     return None
 
-def rewrite_record_file(src_file, dst_file, file_format, file_permission=None,
-        monitoring_intervals=None):
-    records, err = parse_records_file(src_file, monitoring_intervals)
+def convert_perf_to_damon_data(
+        src_file, dst_file, file_format, file_permission=None,
+        monitoring_intervals=None, perf_cmd='perf'):
+    if file_format == file_type_perf_data:
+        os.chmod(file_path, handle.file_permission)
+        return None
+
+    records, err = parse_perf_damon_record(
+            src_file, monitoring_intervals, perf_cmd=perf_cmd)
     if err:
         return err
     return write_damon_records(records, dst_file, file_format,
             file_permission)
 
-def update_records_file(file_path, file_format, file_permission=None,
-        monitoring_intervals=None):
-    return rewrite_record_file(file_path, file_path, file_format,
-            file_permission, monitoring_intervals)
+def convert_trace_cmd_to_damon_data(
+        file_path, file_format, file_permission, monitoring_intervals):
+    try:
+        with open(os.devnull, 'w') as fnull:
+            output = subprocess.check_output(
+                    ['trace-cmd', 'report', '-i', file_path],
+                    stderr=fnull).decode()
+    except Exception as e:
+        return 'trace-cmd report fail (%s)' % e
+    records, err = parse_damon_trace(output, monitoring_intervals)
+    if err:
+        return 'trace-cmd output parsing fail (%s)' % err
+    return write_damon_records(records, file_path, file_format,
+                               file_permission)
 
 # for recording
 
@@ -944,67 +1089,9 @@ def load_proc_stats(filepath):
         kvpairs = json.load(f)
     return [ProcStatsSnapshot.from_kvpairs(x) for x in kvpairs]
 
-def get_childs_pids(pid):
-    try:
-        childs_pids = subprocess.check_output(
-                ['ps', '--ppid', '%s' % pid, '-o', 'pid=']
-                ).decode().split()
-    except:
-        childs_pids = []
-
-    ret = childs_pids
-    for child_pid in childs_pids:
-        childs_childs_pids = get_childs_pids(child_pid)
-        ret.extend(childs_childs_pids)
-
-    return ret
-
-def add_childs_target(kdamonds):
-    # TODO: Support multiple kdamonds
-    if not _damon.target_has_pid(kdamonds[0].contexts[0].ops):
-        return
-    current_targets = kdamonds[0].contexts[0].targets
-
-    for target in current_targets:
-        if target.pid is None:
-            continue
-        childs_pids = get_childs_pids(target.pid)
-        if len(childs_pids) == 0:
-            continue
-
-        # TODO: Commit all at once, out of this loop
-        new_targets = []
-        for child_pid in childs_pids:
-            # skip the child if already in the targets
-            if child_pid in ['%s' % t.pid for t in current_targets]:
-                continue
-            # remove already terminated targets, since committing already
-            # terminated targets to DAMON fails
-            new_targets = [target for target in current_targets
-                    if pid_running('%s' % target.pid)]
-            new_targets.append(_damon.DamonTarget(pid=child_pid, regions=[]))
-        if new_targets == []:
-            continue
-
-        # commit the new set of targets
-        kdamonds[0].contexts[0].targets = new_targets
-        err = _damon.commit(kdamonds, commit_targets_only=True)
-        if err is not None:
-            kdamonds[0].contexts[0].targets = current_targets
-            return 'commit failed (%s)' % err
-    return None
-
-def pid_running(pid):
-    '''pid should be string'''
-    try:
-        subprocess.check_output(['ps', '--pid', pid])
-        return True
-    except:
-        return False
-
 def all_targets_terminated(targets):
     for target in targets:
-        if pid_running('%s' % target.pid):
+        if _damon.pid_running('%s' % target.pid):
             return False
     return True
 
@@ -1023,8 +1110,8 @@ def poll_target_pids(kdamonds):
 
 class RecordingHandle:
     '''
-    Specifies the recording request.  The recording can be started by
-    start_recording(), and finished by finish_recording().
+    Recording requests, status and intermediate results.  The recording can be
+    started by start_recording(), and finished by finish_recording().
 
     As a result of the two function calls, below files can be generated.
 
@@ -1051,14 +1138,19 @@ class RecordingHandle:
     file_format = None
     file_permission = None
 
+    # for custom perf
+    perf_path = None
+
     # for access patterns tracing
     tracepoints = None
     monitoring_intervals = None
-    perf_pipe = None
+    damon_tracer_pipe = None
+    damon_tracer = None
 
     # for access patterns snapshot
-    snapshot_request = None
-    snapshot_records = None
+    snapshot_request = None # SnapshotRequest object.
+    snapshot_records = None # list of DamonRecord objects retrieved via
+                            # get_snapshot_records_of()
     snapshot_count = None
     snapshot_interval_sec = None
 
@@ -1079,12 +1171,23 @@ class RecordingHandle:
 
     timeout = None
 
+    # max length of records per output file.
+    # If a recording is continued longer than this, all information recorded so
+    # far is saved at self.file_path.%Y-%m-%d-%H-%M-%S/ directory.
+    #
+    # default to 3600 seconds (1 hour).
+    # TODO: Add command line option for setting this.
+    max_seconds_per_file = 3600
+    max_seconds_per_file_exceeded = None
+
     def __init__(self, tracepoints, file_path, file_format, file_permission,
                  monitoring_intervals,
                  do_profile,
                  kdamonds, add_child_tasks, record_mem_footprint,
                  record_vmas, record_proc_stats, timeout, snapshot_request,
-                 snapshot_interval_sec, snapshot_count):
+                 snapshot_interval_sec, snapshot_count,
+                 max_seconds_per_file=3600, damon_tracer='perf'):
+        self.damon_tracer = damon_tracer
         self.tracepoints = tracepoints
         self.file_path = file_path
         self.file_format = file_format
@@ -1109,51 +1212,61 @@ class RecordingHandle:
         self.snapshot_interval_sec = snapshot_interval_sec
         self.snapshot_count = snapshot_count
 
+        self.max_seconds_per_file = max_seconds_per_file
+
     def will_take_awhile(self):
         if self.snapshot_interval_sec == 0 and self.snapshot_count < 5:
             return False
         return True
 
-def tracepoint_supported(tracepoint):
-    output = subprocess.check_output([PERF, 'list']).decode().strip()
-    for line in output.split('\n'):
-        fields = line.split()
-        if len(fields) < 3:
-            continue
-        if fields[1:3] != ['[Tracepoint', 'event]']:
-            continue
-        if fields[0] == tracepoint:
-            return True
-    return False
+    def set_perf_path(self, perf_path):
+        if not _damo_subproc.avail_cmd(perf_path):
+            return 'perf not found at "%s"' % perf_path
+        self.perf_path = perf_path
+        return None
 
-def start_recording(handle):
-    kdamonds_file_path = '%s.kdamonds' % handle.file_path
-    with open(kdamonds_file_path, 'w') as f:
-        json.dump([k.to_kvpairs() for k in handle.kdamonds], f, indent=4)
-    os.chmod(kdamonds_file_path, handle.file_permission)
+def start_damon_tracing(handle):
+    perf_cmd = 'perf'
+    if handle.perf_path is not None:
+        perf_cmd = handle.perf_path
 
     if handle.tracepoints is not None:
         tracepoints_option = []
         for tracepoint in handle.tracepoints:
-            if tracepoint_supported(tracepoint):
+            if _damo_sysinfo.damon_tracepoint_available(tracepoint):
                 tracepoints_option += ['-e', tracepoint]
-        handle.perf_pipe = subprocess.Popen(
-                [PERF, 'record', '-a', '-o', handle.file_path] +
-                tracepoints_option)
+        if handle.damon_tracer == 'perf':
+            handle.damon_tracer_pipe = subprocess.Popen(
+                    [perf_cmd, 'record', '-a', '-o', handle.file_path] +
+                    tracepoints_option)
+        elif handle.damon_tracer == 'trace-cmd':
+            handle.damon_tracer_pipe = subprocess.Popen(
+                    ['trace-cmd', 'record', '-o', handle.file_path] +
+                    tracepoints_option,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if handle.do_profile:
-        cmd = [PERF, 'record', '-o', '%s.profile' % handle.file_path]
+        cmd = [perf_cmd, 'record', '-o', '%s.profile' % handle.file_path]
         handle.perf_profile_pipe = subprocess.Popen(cmd)
 
+def record_source_is_running(record_handle):
+    if record_handle.snapshot_request is not None and damon_stat_avail():
+        return True
+    return poll_target_pids(record_handle.kdamonds) or \
+            _damon.any_kdamond_running()
+
+def start_recording(handle):
+    start_damon_tracing(handle)
+
     start_time = time.time()
+    last_output_saved_time = start_time
     nr_snapshots_to_take = handle.snapshot_count
     if handle.snapshot_interval_sec:
         sleep_time = handle.snapshot_interval_sec
     else:
         sleep_time = 1
-    while (poll_target_pids(handle.kdamonds) or
-           _damon.any_kdamond_running()):
+    while record_source_is_running(handle):
         if handle.add_child_tasks is True:
-            add_childs_target(handle.kdamonds)
+            _damon.add_commit_vaddr_child_targets(handle.kdamonds)
 
         if handle.mem_footprint_snapshots is not None:
             record_mem_footprint(handle.kdamonds,
@@ -1167,6 +1280,22 @@ def start_recording(handle):
         if (handle.timeout is not None and
             time.time() - start_time >= handle.timeout):
             break
+        if (handle.max_seconds_per_file is not None and time.time() -
+            last_output_saved_time >= handle.max_seconds_per_file):
+            last_output_saved_time = time.time()
+            handle.max_seconds_per_file_exceeded = True
+
+            save_recording_outputs(handle, handle.file_path)
+
+            if handle.mem_footprint_snapshots is not None:
+                handle.mem_footprint_snapshots = []
+            if handle.vmas_snapshots is not None:
+                handle.vmas_snapshots = []
+            if handle.proc_stats is not None:
+                handle.proc_stats = []
+            if handle.snapshot_records is not None:
+                handle.snapshot_records = []
+            start_damon_tracing(handle)
 
         if handle.snapshot_request:
             if handle.snapshot_records is None:
@@ -1183,26 +1312,48 @@ def start_recording(handle):
 
         time.sleep(sleep_time)
 
-def finish_recording(handle):
-    if handle.perf_pipe:
+def save_recording_outputs(handle, file_path):
+    if handle.max_seconds_per_file_exceeded is True:
+        dirname = '%s.%s' % (
+                handle.file_path,
+                datetime.datetime.now().strftime('%Y-%m-%d-%H-%M-%S'))
+        os.mkdir(dirname)
+        file_path = os.path.join(dirname, file_path)
+
+    kdamonds_file_path = '%s.kdamonds' % file_path
+    with open(kdamonds_file_path, 'w') as f:
+        json.dump([k.to_kvpairs() for k in handle.kdamonds], f, indent=4)
+    os.chmod(kdamonds_file_path, handle.file_permission)
+
+    if handle.damon_tracer_pipe:
         try:
-            handle.perf_pipe.send_signal(signal.SIGINT)
-            handle.perf_pipe.wait()
+            handle.damon_tracer_pipe.send_signal(signal.SIGINT)
+            handle.damon_tracer_pipe.wait()
         except:
             # perf might already finished
             pass
+        os.rename(handle.file_path, file_path)
 
-        if handle.file_format == file_type_perf_data:
-            os.chmod(handle.file_path, handle.file_permission)
-        else:
-            err = update_records_file(handle.file_path, handle.file_format,
-                    handle.file_permission, handle.monitoring_intervals)
+        if handle.damon_tracer == 'perf':
+            perf_cmd = 'perf'
+            if handle.perf_path is not None:
+                perf_cmd = handle.perf_path
+            err = convert_perf_to_damon_data(
+                    src_file=file_path, dst_file=file_path,
+                    file_format=handle.file_format,
+                    file_permission=handle.file_permission,
+                    monitoring_intervals=handle.monitoring_intervals,
+                    perf_cmd=perf_cmd)
             if err is not None:
                 print('converting format from perf_data to %s failed (%s)' %
                         (handle.file_format, err))
+        if handle.damon_tracer == 'trace-cmd':
+            err = convert_trace_cmd_to_damon_data(
+                    file_path, handle.file_format, handle.file_permission,
+                    handle.monitoring_intervals)
 
     if handle.snapshot_records:
-        write_damon_records(handle.snapshot_records, handle.file_path,
+        write_damon_records(handle.snapshot_records, file_path,
                             handle.file_format, handle.file_permission)
 
     if handle.perf_profile_pipe is not None:
@@ -1211,18 +1362,27 @@ def finish_recording(handle):
         except:
             # perf might already finished
             pass
-        os.chmod('%s.profile' % handle.file_path, handle.file_permission)
+        if not os.path.isfile('%s.profile' % handle.file_path):
+            # perf output might not generated due to absence of events.
+            pass
+        else:
+            os.rename('%s.profile' % handle.file_path, '%s.profile' %
+                      file_path)
+            os.chmod('%s.profile' % file_path, handle.file_permission)
 
     if handle.mem_footprint_snapshots is not None:
         save_mem_footprint(
                 handle.mem_footprint_snapshots,
-                '%s.mem_footprint' % handle.file_path, handle.file_permission)
+                '%s.mem_footprint' % file_path, handle.file_permission)
     if handle.vmas_snapshots is not None:
-        save_proc_vmas(handle.vmas_snapshots, '%s.vmas' % handle.file_path,
+        save_proc_vmas(handle.vmas_snapshots, '%s.vmas' % file_path,
                        handle.file_permission)
     if handle.proc_stats is not None:
-        save_proc_stats(handle.proc_stats, '%s.proc_stats' % handle.file_path,
+        save_proc_stats(handle.proc_stats, '%s.proc_stats' % file_path,
                         handle.file_permission)
+
+def finish_recording(handle):
+    save_recording_outputs(handle, handle.file_path)
 
 # for snapshot
 
@@ -1282,22 +1442,28 @@ def can_merge(left_region, right_region):
             left_region.nr_accesses == right_region.nr_accesses and
             left_region.age == right_region.age)
 
+def merged_regions(regions):
+    merged = []
+
+    for region in regions:
+        if len(merged) > 0:
+            last_region = merged[-1]
+            if can_merge(last_region, region):
+                last_region.end = region.end
+                if last_region.sz_filter_passed is not None:
+                    last_region.sz_filter_passed += region.sz_filter_passed
+                continue
+        merged.append(region)
+    return merged
+
 def tried_regions_to_snapshot(scheme, intervals, merge_regions):
     snapshot_end_time_ns = time.time() * 1000000000
     snapshot_start_time_ns = snapshot_end_time_ns - intervals.aggr * 1000
-    regions = []
 
-    for tried_region in scheme.tried_regions:
-        '''Merge regions that having same access pattern, since DAMON usually
-        splits regions unnecessarily to keep the min_nr_regions'''
-        if merge_regions and len(regions) > 0:
-            last_region = regions[-1]
-            if can_merge(last_region, tried_region):
-                last_region.end = tried_region.end
-                if last_region.sz_filter_passed is not None:
-                    last_region.sz_filter_passed += tried_region.sz_filter_passed
-                continue
-        regions.append(tried_region)
+    if merge_regions:
+        regions = merged_regions(scheme.tried_regions)
+    else:
+        regions = [r for r in scheme.tried_regions]
     if scheme.tried_bytes is not None:
         total_bytes = scheme.tried_bytes
     else:
@@ -1326,66 +1492,6 @@ def tried_regions_to_records_of(idxs, merge_regions):
                 records[-1].snapshots.append(snapshot)
                 break
     return records
-
-def three_regions_of(pid):
-    '''
-    Return three big mapped virtual address ranges of a given process, which
-    separated by the two huge gaps[1].
-
-    [1] https://docs.kernel.org/mm/damon/design.html#vma-based-target-address-range-construction
-    '''
-    if not os.path.isfile('/proc/%s/maps' % pid):
-        print('maps file for %s pid not found' % pid)
-        exit(0)
-    with open('/proc/%s/maps' % pid, 'r') as f:
-        maps_content = f.read()
-    regions = []
-    for line in maps_content.split('\n'):
-        if line == '':
-            continue
-        start, end = [int(addr, 16) for addr in line.split()[0].split('-')]
-        if len(regions) > 0 and regions[-1].end == start:
-            regions[-1].end = end
-        else:
-            regions.append(_damon.DamonRegion(start, end))
-
-    gaps = []
-    for idx, region in enumerate(regions):
-        if idx == 0:
-            continue
-        prev_region = regions[idx - 1]
-        if region.start != prev_region.end:
-            gaps.append([prev_region.end, region.start])
-    gaps.sort(key=lambda x: x[1] - x[0], reverse=True)
-    if len(gaps) < 2:
-        return regions
-    # sort biggest two gaps in address
-    gaps = sorted(gaps[:2], key=lambda x: x[0])
-
-    return [_damon.DamonRegion(regions[0].start, gaps[0][0]),
-            _damon.DamonRegion(gaps[0][1], gaps[1][0]),
-            _damon.DamonRegion(gaps[1][1], regions[-1].end)]
-
-def install_target_regions_if_needed(kdamonds):
-    '''Returns an error string, or None'''
-    need_install = False
-    for kd in kdamonds:
-        for ctx in kd.contexts:
-            if ctx.ops != 'vaddr':
-                continue
-            need_install = True
-            for target in ctx.targets:
-                target.regions = three_regions_of(target.pid)
-    if not need_install:
-        return None
-    err = _damon.commit(kdamonds)
-    for kd in kdamonds:
-        for ctx in kd.contexts:
-            if ctx.ops != 'vaddr':
-                continue
-            for target in ctx.targets:
-                target.regions = []
-    return err
 
 def update_get_snapshot_records(kdamond_idxs, scheme_idxs,
         total_sz_only, merge_regions):
@@ -1445,10 +1551,6 @@ def get_snapshot_records(monitor_scheme, total_sz_only, merge_regions):
         return None, 'no kdamond running'
 
     orig_kdamonds = _damon.current_kdamonds()
-
-    err = install_target_regions_if_needed(orig_kdamonds)
-    if err is not None:
-        return None, 'vaddr region install failed (%s)' % err
 
     installed, idxs, updated_kdamonds, err = find_install_scheme(
             monitor_scheme)
@@ -1590,10 +1692,123 @@ def filter_records_by_temperature(records, temperature_ranges,
             snapshot.regions = filtered_regions
             snapshot.update_total_bytes()
 
+class SnapshotRequest:
+    '''
+    Request for getting single snapshot records from running kdamonds.
+    '''
+    tried_regions_of = None
+
+    # filter to be applied using DAMOS filters, if available.
+    snapshot_damos_filters = None
+
+    # filter to be applied on retrieved snapshot, by damo.
+    record_filter = None
+
+    # more detailed requests
+    total_sz_only = None
+    dont_merge_regions = None
+
+    def __init__(
+            self, tried_regions_of=None, snapshot_damos_filters=None,
+            record_filter=None, total_sz_only=False, dont_merge_regions=True):
+        self.tried_regions_of = tried_regions_of
+        self.snapshot_damos_filters = snapshot_damos_filters
+        self.record_filter = record_filter
+        self.total_sz_only = total_sz_only
+        self.dont_merge_regions = dont_merge_regions
+
+def damon_stat_avail():
+    param_dir = '/sys/module/damon_stat/parameters/'
+    aggr_interval_us_file = os.path.join(param_dir, 'aggr_interval_us')
+    if not os.path.isfile(aggr_interval_us_file):
+        return False
+    enabled_file = os.path.join(param_dir, 'enabled')
+    with open(enabled_file, 'r') as f:
+        if f.read().strip().lower() == 'n':
+            return False
+    return True
+
+def should_get_snapshot_from_damon_stat(request):
+    if request.tried_regions_of is not None:
+        return False
+    if request.snapshot_damos_filters:
+        return False
+
+    if _damon.any_kdamond_running():
+        return False
+
+    return damon_stat_avail()
+
+def read_damon_stat_param(param_name):
+    file_path = os.path.join('/sys/module/damon_stat/parameters', param_name)
+    with open(file_path, 'r') as f:
+        return f.read().strip()
+
+def get_snapshot_records_of_damon_stat(request):
+    aggr_interval_us = int(read_damon_stat_param('aggr_interval_us'))
+    sample_interval_us = aggr_interval_us / 20
+    snapshot_intervals = _damon.DamonIntervals(
+            sample=sample_interval_us, aggr=aggr_interval_us,
+            ops_update=60* 1000 * 1000,
+            intervals_goal=_damon.DamonIntervalsGoal(
+                access_bp=400, aggrs=3, min_sample_us=5000,
+                max_sample_us=10000000))
+
+    record = DamonRecord(kd_idx=-1, ctx_idx=0, intervals=snapshot_intervals,
+                         scheme_idx=None, target_id=0, scheme_filters=[],
+                         data_source=record_data_source_damon_stat)
+
+    snapshot_end_time_ns = time.time() * 1000000000
+    snapshot_start_time_ns = snapshot_end_time_ns - aggr_interval_us * 1000
+    idle_ms_percentiles = read_damon_stat_param('memory_idle_ms_percentiles')
+    idle_ms_percentiles = [int(x) for x in idle_ms_percentiles.split(',')]
+
+    mem_total_bytes = None
+    with open('/proc/meminfo', 'r') as f:
+        for line in f:
+            fields = line.split()
+            if fields[0] != 'MemTotal:':
+                continue
+            mem_total_bytes = int(fields[1]) * 1024
+    if mem_total_bytes is None:
+        return None, 'MemTotal retrieval fail'
+
+    regions = []
+    for percentile in range(100):
+        idle_ms_min = idle_ms_percentiles[percentile]
+        idle_ms_max = idle_ms_percentiles[percentile + 1]
+        idle_ms = int((idle_ms_min + idle_ms_max) / 2)
+
+        if idle_ms < 0:
+            nr_accesses_sample = 10
+        else:
+            nr_accesses_sample = 0
+
+        region = _damon.DamonRegion(
+                start=int(percentile * mem_total_bytes / 100),
+                end=int((percentile + 1) * mem_total_bytes / 100),
+                nr_accesses=nr_accesses_sample,
+                nr_accesses_unit=_damon.unit_samples,
+                age=idle_ms * 1000, age_unit=_damon.unit_usec,
+                sz_filter_passed=0)
+        regions.append(region)
+    if not request.dont_merge_regions:
+        regions = merged_regions(regions)
+
+    snapshot = DamonSnapshot(
+            start_time=snapshot_start_time_ns, end_time=snapshot_end_time_ns,
+            regions=regions, total_bytes=mem_total_bytes, damos_stats=None,
+            sample_interval_us=sample_interval_us)
+
+    record.snapshots = [snapshot]
+    return [record], None
+
 def get_snapshot_records_of(request):
     '''
     get records containing single snapshot from running kdamonds
     '''
+    if should_get_snapshot_from_damon_stat(request):
+        return get_snapshot_records_of_damon_stat(request)
     if request.tried_regions_of is None:
         access_pattern = _damon.DamosAccessPattern()
         filters = []
@@ -1689,40 +1904,9 @@ def set_snapshot_damos_filters_option(parser):
                 'Format is same to --damos_filter.'
                 ]))
 
-class RecordGetRequest:
-    # TODO: Extend to be used for recording
-
-    # source of the record.  If both are None, get snapshot
-    tried_regions_of = None
-    record_file = None
-
-    snapshot_damos_filters = None
-
-    record_filter = None
-
-    # more detailed requests
-    total_sz_only = None
-    dont_merge_regions = None
-
-    def __init__(
-            self, tried_regions_of=None, record_file=None,
-            snapshot_damos_filters=None,
-            record_filter=None,
-            total_sz_only=False, dont_merge_regions=True):
-        self.tried_regions_of = tried_regions_of
-        self.record_file = record_file
-        self.snapshot_damos_filters = snapshot_damos_filters
-        self.record_filter = record_filter
-        self.total_sz_only = total_sz_only
-        self.dont_merge_regions = dont_merge_regions
-
 def get_records(tried_regions_of=None, record_file=None,
                 snapshot_damos_filters=None, record_filter=None,
                 total_sz_only=False, dont_merge_regions=True):
-    request = RecordGetRequest(
-            tried_regions_of, record_file, snapshot_damos_filters,
-            record_filter, total_sz_only, dont_merge_regions)
-
     # If record is live snapshot, access pattern filtering is applied with
     # get_snapshot_records_of() because it uses DAMOS to get the snapshot.  If
     # the kernel has schemes_filters_addr feature, address ranges filter is
@@ -1735,8 +1919,11 @@ def get_records(tried_regions_of=None, record_file=None,
     else:
         filter_copy = RecordFilter(None, None, None, None, None, None, None)
 
-    if request.record_file is None:
-        records, err = get_snapshot_records_of(request)
+    if record_file is None:
+        records, err = get_snapshot_records_of(
+                SnapshotRequest(
+                    tried_regions_of, snapshot_damos_filters,
+                    record_filter, total_sz_only, dont_merge_regions))
         if err is not None:
             return None, err
         filter_copy.access_pattern = None
@@ -1744,10 +1931,10 @@ def get_records(tried_regions_of=None, record_file=None,
             filter_copy.address_ranges = None
             filter_copy.snapshot_time_ranges = None
     else:
-        if type(request.record_file) is not list:
-            request.record_file = [request.record_file]
+        if type(record_file) is not list:
+            record_file = [record_file]
         records = []
-        for record_file in request.record_file:
+        for record_file in record_file:
             if not os.path.isfile(record_file):
                 return None, '%s not found' % record_file
 

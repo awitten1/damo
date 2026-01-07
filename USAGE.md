@@ -459,6 +459,17 @@ permission.  The output files will also be owned by `root` and have `600`
 permission by default, so only root can read those.  Users can change the
 permission via `--output_permission` option.
 
+If the command runs long time, resulting output files could be too huge to
+process in a practically short time.  To avoid the problems from such too huge
+output files, `damo record` flushes the outputs per user-specified time into
+intermediate output files.  The time can be specified in seconds, using
+`--output_flush_sec` option.  The default value is 3600 seconds (one hour).
+The intermediate output files are complete ones, so can be processed like
+normal output files.  The autoamtically split outputs are stored in directories
+named as `<given_out_file>.<timestamp>`.  `<given_out_file>` is same to the
+`--out` option input, which is `damon.data` by default.  `<timestamp>` is the
+time of the intermediate record creation, in `%Y-%m-%d-%H-%M-%S` format.
+
 For the DAMON's monitoring results, it retrieves and saves every
 DAMON-generated monitoring result snapshots.  Because DAMON's monitoring result
 snapshot contains `age` information, the full record is not always required.
@@ -570,7 +581,24 @@ for retrieving status of specific parts.
 ### `damo report access`
 
 `damo report access` visualizes DAMON's access monitoring result snapshots in
-customizable formats.  Users can set it to use `damo record`-generated
+customizable formats.  From where the data to visualize is retrieved is decided
+based on the given command line options and system status.
+
+- If `--input_file` option is given with `damo record`-generated monitoring
+  results record, the record is used.
+- If no data source specification command line option is given, the source of
+  data is decided based on the system status.
+  - If any `damo start`-started DAMON instance is running, its current
+    monitoring results snapshot is used.
+  - Else if `./damon.data` file exists, use `./damon.data` as `--input_file`.
+  - Else if
+    [`DAMON_STAT`](https://docs.kernel.org/admin-guide/mm/damon/stat.html) is
+    running, its `memory_idle_ms_percentiles` snapshot is used.  Note that
+    `memory_idle_ms_percentiles` provides only a subset of the access pattern,
+    and hence re-constructed access pattern information lacks many details and
+    accuracy.
+
+Users can set it to use `damo record`-generated
 monitoring results record as the source using `--input_file` option.  If
 `--input_file` is not provided and DAMON is running, it captures snapshot from
 the running DAMON and uses it as the source.  If `--input_file` is not provided,

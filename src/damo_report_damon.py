@@ -4,12 +4,14 @@
 Show status of DAMON.
 """
 
+import argparse
 import collections
 import json
 import random
 import time
 
 import _damo_fmt_str
+import _damo_yaml
 import _damon
 import _damon_args
 
@@ -20,7 +22,7 @@ def read_kdamonds_from_file(input_file):
         return None, 'reading %s failed (%s)' % (input_file, err)
     return kdamonds, None
 
-def pr_damon_parameters(input_file, json_format, raw_nr, omit_defaults):
+def pr_damon_parameters(input_file, format, raw_nr, omit_defaults):
     if input_file is None:
         kdamonds = _damon.current_kdamonds()
     else:
@@ -42,11 +44,10 @@ def pr_damon_parameters(input_file, json_format, raw_nr, omit_defaults):
                 s.stats = None
                 s.tried_regions = None
 
-    pr_kdamonds(kdamonds, json_format, raw_nr, show_cpu=False,
+    pr_kdamonds(kdamonds, format, raw_nr, show_cpu=False,
                 params_only=True)
 
-def update_pr_schemes_stats(input_file, json_format, raw_nr,
-                            damos_stat_fields):
+def update_pr_schemes_stats(input_file, format, raw_nr, damos_stat_fields):
     if input_file is None:
         err = _damon.update_schemes_stats()
         if err:
@@ -73,8 +74,15 @@ def update_pr_schemes_stats(input_file, json_format, raw_nr,
                     stat_kvpair = filtered_stat_kvpair
                 stats.append([indices, stat_kvpair])
 
-    if json_format:
+    if format == 'json':
         print(json.dumps(stats, indent=4))
+        return
+    elif format == 'yaml':
+        text, err = _damo_yaml.dump(stats)
+        if err is not None:
+            print('yaml dump fail (%s)' % err)
+            exit(1)
+        print(text)
         return
 
     for indices, stat_kvpair in stats:
@@ -89,7 +97,7 @@ def update_pr_schemes_stats(input_file, json_format, raw_nr,
         if len(stats) > 1:
             print()
 
-def pr_kdamonds_summary(input_file, json_format, raw_nr, show_cpu):
+def pr_kdamonds_summary(input_file, format, raw_nr, show_cpu):
     if input_file is None:
         kdamonds = _damon.current_kdamonds()
     else:
@@ -98,39 +106,69 @@ def pr_kdamonds_summary(input_file, json_format, raw_nr, show_cpu):
             print(err)
             exit(1)
     summary = [k.summary_str(show_cpu, raw_number=raw_nr) for k in kdamonds]
-    if json_format:
+    if format == 'json':
         print(json.dumps(summary, indent=4))
+        return
+    elif format == 'yaml':
+        text, err = _damo_yaml.dump(summary)
+        if err is not None:
+            print('yaml dump fail (%s)' % err)
+            exit(1)
+        print(text)
         return
     for idx, line in enumerate(summary):
         print('%d\t%s' % (idx, line))
 
-def pr_kdamonds(kdamonds, json_format, raw_nr, show_cpu, params_only=False):
-    if json_format:
+def pr_kdamonds(kdamonds, format, raw_nr, show_cpu, params_only=False,
+                omit_damos_tried_regions=False):
+    if format == 'json':
         print(json.dumps([k.to_kvpairs(raw_nr) for k in kdamonds], indent=4))
+    elif format == 'yaml':
+        text, err = _damo_yaml.dump([k.to_kvpairs(raw_nr) for k in kdamonds])
+        if err is not None:
+            print('yaml dump fail (%s)' % err)
+            exit(1)
+        print(text)
     else:
         for idx, k in enumerate(kdamonds):
             print('kdamond %d' % idx)
             print(_damo_fmt_str.indent_lines(
-                k.to_str(raw_nr, show_cpu, params_only), 4))
+                k.to_str(raw_nr, show_cpu, params_only,
+                         omit_damos_tried_regions), 4))
 
 def main(args):
     _damon.ensure_root_and_initialized(args)
 
+    if args.json and args.format is None:
+        args.format = 'json'
+    if args.format is None:
+        args.format = 'report'
+
     if args.damon_params or args.damon_params_omit_defaults:
-        return pr_damon_parameters(args.input_file, args.json, args.raw,
+        return pr_damon_parameters(args.input_file, args.format, args.raw,
                                    args.damon_params_omit_defaults)
 
     if args.kdamonds_summary:
-        return pr_kdamonds_summary(args.input_file, args.json, args.raw,
+        return pr_kdamonds_summary(args.input_file, args.format, args.raw,
                                    args.show_cpu_usage)
 
     if args.damos_stats:
-        return update_pr_schemes_stats(args.input_file, args.json, args.raw,
+        return update_pr_schemes_stats(args.input_file, args.format, args.raw,
                                        args.damos_stat_fields)
 
     if args.input_file is None:
+        update_tried_regions = True
+        # tried regions are not printed when --omit_damos_tried_regions or
+        # --json is set.  When --json is set, the output is formatted via
+        # Damos.to_kvpairs(), which doesn't include tried regions information.
+        # Updating tried regions for such cases makes no sense but just incur
+        # system overhead and user delay, so don't do the update in the case.
+        if args.omit_damos_tried_regions or args.format:
+            update_tried_regions = False
+
         kdamonds, err = _damon.update_read_kdamonds(
-                nr_retries=5, update_stats=True, update_tried_regions=True,
+                nr_retries=5, update_stats=True,
+                update_tried_regions=update_tried_regions,
                 update_quota_effective_bytes=True,
                 # todo: set update_tuned_intervals as False if not needed
                 do_update_tuned_intervals=True)
@@ -142,11 +180,17 @@ def main(args):
         if err is not None:
             print(err)
             exit(1)
-    pr_kdamonds(kdamonds, args.json, args.raw, args.show_cpu_usage)
+    pr_kdamonds(kdamonds, args.format, args.raw, args.show_cpu_usage,
+                args.omit_damos_tried_regions)
 
 def set_argparser(parser):
+    parser.add_argument(
+            '--format', choices=['json', 'yaml', 'report'],
+            help='format of the output')
     parser.add_argument('--json', action='store_true', default=False,
-            help='print output in json format')
+                        # suppress help message in favor of --format.
+                        # help='print output in json format')
+                        help=argparse.SUPPRESS)
     parser.add_argument('--raw', action='store_true', default=False,
             help='print raw numbers')
     parser.add_argument('--show_cpu_usage', action='store_true', default=False,
@@ -159,6 +203,8 @@ def set_argparser(parser):
             choices=['nr_tried', 'sz_tried', 'nr_applied', 'sz_applied',
                 'qt_exceeds'], nargs='+',
             help='DAMOS stat fields to print')
+    parser.add_argument('--omit_damos_tried_regions', action='store_true',
+                        help='omit DAMOS tried regions')
     parser.add_argument('--damon_params', action='store_true',
             help='print entered DAMON parameters only')
     parser.add_argument('--damon_params_omit_defaults', action='store_true',

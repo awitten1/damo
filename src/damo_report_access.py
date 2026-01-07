@@ -62,6 +62,9 @@ record_formatters = [
                   lambda record, fmt:
                   record.intervals.intervals_goal.to_str(fmt.raw_number),
                   'monitoring intervals'),
+        Formatter('<data source>',
+                  lambda record, fmt: record.data_source,
+                  'data source of the record'),
         Formatter('<format strings>',
                   lambda record, fmt: format_strings(fmt),
                   'current format strings')
@@ -1123,8 +1126,9 @@ def pr_records_raw_form(records, raw_number):
             continue
 
         base_time = snapshots[0].start_time
-        lines.append('base_time_absolute: %s\n' %
+        lines.append('base_time_absolute: %s' %
                 _damo_fmt_str.format_time_ns(base_time, raw_number))
+        lines.append('data source: %s\n' % record.data_source)
 
         for snapshot in snapshots:
             lines.append('monitoring_start:    %16s' %
@@ -1385,9 +1389,12 @@ def set_formats_percentiles(args, fmt, records, recency_or_temperature):
     fmt.format_region = ''
 
 def set_formats_handle_format_set_arg(fmt, format_arg):
-    '''Handle --format inputs except 'append' ones'''
+    '''
+    Apply --format inputs except 'append' ones, update fmt (ReportFormat).
+    Returns updated fmt and error if failed.
+    '''
     if format_arg is None:
-        return
+        return fmt, None
     if len(format_arg) == 1 and len(format_arg[0]) == 1:
         fmt_string = format_arg[0][0]
         if os.path.isfile(fmt_string):
@@ -1417,6 +1424,7 @@ def set_formats_handle_format_set_arg(fmt, format_arg):
                 fmt.format_snapshot_tail = fmt_string
             elif target_area == 'record_tail':
                 fmt.format_record_tail = fmt_string
+    return fmt, None
 
 def set_formats_handle_styles(fmt, args, records):
     if args.style is None:
@@ -1431,9 +1439,10 @@ def set_formats_handle_styles(fmt, args, records):
         fmt.region_box_min_max_length = [1, 40]
         fmt.region_box_align = 'right'
         fmt.region_box_colorset = 'emotion'
-    elif args.style in ['temperature-sz-hist', 'recency-sz-hist']:
+    elif args.style in ['temperature-sz-hist', 'recency-sz-hist',
+                        'cold-memory-tail']:
         set_formats_hist_style(args, fmt, records)
-    elif args.style == 'recency-percentiles':
+    elif args.style in ['recency-percentiles', 'idle-time-percentiles']:
         set_formats_percentiles(args, fmt, records, 'recency')
     elif args.style == 'temperature-percentiles':
         set_formats_percentiles(args, fmt, records, 'temperature')
@@ -1474,6 +1483,15 @@ def set_formats_record_default(fmt, records):
         tail_lines = ['record DAMON intervals: <intervals>']
         if intervals_goal_enabled(records):
             tail_lines.append('# <intervals goal>')
+        show_data_source = False
+        for record in records:
+            if record.data_source == \
+                    _damo_records.record_data_source_damon_stat:
+                show_data_source = True
+                break
+        if show_data_source:
+            tail_lines.append('# data source: <data source>')
+
         fmt.format_record_tail = '\n'.join(tail_lines)
 
 def set_formats_snapshot_default(fmt, records, args, ops_filters_installed):
@@ -1563,7 +1581,9 @@ def set_formats_handle_format_append_arg(fmt, format_args):
 def set_formats(args, records):
     fmt = ReportFormat.from_args(args)
 
-    set_formats_handle_format_set_arg(fmt, args.format)
+    fmt, err = set_formats_handle_format_set_arg(fmt, args.format)
+    if err is not None:
+        return fmt, err
     set_formats_handle_styles(fmt, args, records)
 
     if args.total_sz_only:
@@ -1677,10 +1697,39 @@ def handle_exec(cmd, records):
     recursive_del(script_dir_path)
     return None
 
+def handle_args_input(args):
+    if args.input is None:
+        return None
+
+    tried_regions_of_list = []
+    input_files = []
+    for input_args in args.input:
+        if input_args[0] == 'tried_regions_of':
+            if len(input_args) != 4:
+                return 'wrong number of args for tried_regions_of'
+            try:
+                tried_regions_of_list.append([int(x) for x in input_args[1:]])
+            except:
+                return 'tried_regions_of should get only ints'
+        elif len(input_args) == 1 and os.path.isfile(input_args[0]):
+            input_files.append(input_args[0])
+        else:
+            return 'unsupported input'
+    if len(tried_regions_of_list) > 0:
+        args.tried_regions_of = tried_regions_of_list
+    if len(input_files) > 0:
+        args.input_file = input_files
+    return None
+
 def read_and_show(args):
     record_filter, err = _damo_records.args_to_filter(args)
     if err != None:
         print(err)
+        exit(1)
+
+    err = handle_args_input(args)
+    if err is not None:
+        print('--input handling failed (%s)' % err)
         exit(1)
 
     if args.input_file == None:
@@ -1745,6 +1794,7 @@ def read_and_show(args):
         fmt, err = set_formats(args, records)
         if err is not None:
             print('format setting failed (%s)' % err)
+            exit(1)
 
         if args.on_cache is not None:
             sz_cache = _damo_fmt_str.text_to_bytes(args.on_cache[0])
@@ -1774,8 +1824,13 @@ def add_fmt_args(parser, hide_help=False):
     # how to show, in simple selection
     parser.add_argument(
             '--style', choices=['detailed', 'simple-boxes',
-                                'temperature-sz-hist', 'recency-sz-hist',
-                                'recency-percentiles',
+                                'temperature-sz-hist',
+                                # cold-memory-tail is just another name of
+                                # recency-sz-hist
+                                'recency-sz-hist', 'cold-memory-tail',
+                                # idle-time-percentiles is just another name of
+                                # recency-percentiles
+                                'recency-percentiles', 'idle-time-percentiles',
                                 'temperature-percentiles',
                                 'cold', 'hot'],
             default='detailed',
@@ -1954,6 +2009,14 @@ def set_argparser(parser):
     # what to show
     _damo_records.set_filter_argparser(parser, hide_help=True)
 
+    parser.add_argument(
+            '--input', '-i', metavar='<file or special words>', nargs='+',
+            action='append',
+            help=' '.join([
+                'Source of the access pattern to show.',
+                'Can be file or',
+                '"tried_regions_of <kdamond idx> <context idx> <scheme idx>"'
+                ]))
     parser.add_argument('--input_file', metavar='<file>', nargs='+',
             help='source of the access pattern to show')
     parser.add_argument('--tried_regions_of', nargs=3, type=int,

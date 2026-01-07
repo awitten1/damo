@@ -18,6 +18,7 @@ except ModuleNotFoundError as e:
     pass
 
 import _damo_subproc
+import _damo_sysinfo
 import _damon
 import damo_pa_layout
 
@@ -260,18 +261,29 @@ def damos_quotas_cons_arg(cmd_args):
 
 def damos_options_to_quota_goal(garg):
     # garg is the user inputs
-    # garg should be <metric> <target value> [<current value>|<nid>]
-    # [current value] is given for only 'user_input' <metric>
-    # [nid] is given for only node_mem_{used,free}_bp
-    if not len(garg) in [2, 3]:
+    # garg should be <metric> <target value> [<optional>...]
+    # for user_input, one optional argument for "current value" is given.
+    # for node_mem[cg]_{used,free}_bp, one optional argument for node id is
+    # given.
+    # for node_memcg_{used,free}_bp, one more optional argument for memcg path
+    # is given.
+    if not len(garg) in [2, 3, 4]:
         return None, 'Wrong --damos_quota_goal (%s)' % garg
     metric, target_value, optionals = garg[0], garg[1], garg[2:]
     current_value = 0
     nid = None
-    if _damon.DamosQuotaGoal.metric_require_nid(metric):
+    memcg_path = None
+    if metric in [_damon.qgoal_node_mem_used_bp,
+                  _damon.qgoal_node_mem_free_bp]:
         if len(optionals) != 1:
             return None, 'nid is not given or something else is given'
         nid = optionals[0]
+    elif metric in [_damon.qgoal_node_memcg_used_bp,
+                    _damon.qgoal_node_memcg_free_bp]:
+        if len(optionals) != 2:
+            return None, 'nid and memcg_path required'
+        nid = optionals[0]
+        memcg_path = optionals[1]
     elif metric == 'user_input':
         if len(optionals) != 1:
             return None, 'current value is not given or something else is given'
@@ -279,7 +291,8 @@ def damos_options_to_quota_goal(garg):
     try:
         return _damon.DamosQuotaGoal(
                 metric=metric, target_value=target_value,
-                current_value=current_value, nid=nid), None
+                current_value=current_value,
+                nid=nid, memcg_path=memcg_path), None
     except Exception as e:
         return None, 'DamosQuotaGoal creation fail (%s, %s)' % (garg, e)
 
@@ -302,8 +315,10 @@ def damos_options_to_quotas(quotas, goals):
         return None, 'Wrong --damos_quotas (%s, %s)' % (qargs, e)
     return quotas, None
 
-def damos_options_to_scheme(sz_region, access_rate, age, action,
-        apply_interval, quotas, goals, wmarks, target_nid, filters, dests):
+def damos_options_to_scheme(
+        sz_region, access_rate, age, action,
+        apply_interval, quotas, goals, wmarks, target_nid, filters, dests,
+        max_nr_snapshots):
     if quotas != None:
         quotas, err = damos_options_to_quotas(quotas, goals)
         if err is not None:
@@ -321,57 +336,84 @@ def damos_options_to_scheme(sz_region, access_rate, age, action,
     if err != None:
         return None, err
 
+    if max_nr_snapshots is None:
+        stats = _damon.DamosStats()
+    else:
+        stats = _damon.DamosStats(max_nr_snapshots=max_nr_snapshots)
+
     try:
         return _damon.Damos(
                 access_pattern=_damon.DamosAccessPattern(sz_region,
                     access_rate, _damon.unit_percent, age, _damon.unit_usec),
                 action=action, target_nid=target_nid,
                 dests=dests, apply_interval_us=apply_interval, quotas=quotas,
-                watermarks=wmarks, filters=filters), None
+                watermarks=wmarks, filters=filters, stats=stats), None
     except Exception as e:
         return None, 'Wrong \'--damos_*\' argument (%s)' % e
 
-def damos_options_to_schemes(args):
-    if args.damos_quota_interval:
-        for i, interval in enumerate(args.damos_quota_interval):
-            t, s = 0, 0
-            if i < len(args.damos_quota_time):
-                t = args.damos_quota_time[i]
-            if i < len(args.damos_quota_space):
-                s = args.damos_quota_space[i]
-            if i < len(args.damos_quota_weights):
-                w1, w2, w3 = args.damos_quota_weights[i]
-            else:
-                w1, w2, w3 = 1, 1, 1
-            args.damos_quotas.append([t, s, interval, w1, w2, w3])
+def set_args_damos_quotas(args):
+    # DAMOS quotas can be set using
+    # 1) only --damos_quotas (specify time, space, interval, weights at once),
+    #    or
+    # 2) --damos_quota_interval, --damos_quota_time, --damos_quota_space,
+    #    and --damos_quota_weights (specify the components one by one).
+    # Convert quotas specified in 2) way into --damos_quotas for easier
+    # handling.
+    if not args.damos_quota_interval:
+        return
+    for i, interval in enumerate(args.damos_quota_interval):
+        t, s = 0, 0
+        if i < len(args.damos_quota_time):
+            t = args.damos_quota_time[i]
+        if i < len(args.damos_quota_space):
+            s = args.damos_quota_space[i]
+        if i < len(args.damos_quota_weights):
+            w1, w2, w3 = args.damos_quota_weights[i]
+        else:
+            w1, w2, w3 = 1, 1, 1
+        args.damos_quotas.append([t, s, interval, w1, w2, w3])
+
+def verify_set_damos_args_len(args):
+    # return an error string if given args is wrong in terms of lengths.
     nr_schemes = len(args.damos_action)
+
     if len(args.damos_sz_region) > nr_schemes:
-        return [], 'too much --damos_sz_region'
+        return 'too much --damos_sz_region'
     if len(args.damos_access_rate) > nr_schemes:
-        return [], 'too much --damos_access_rate'
+        return 'too much --damos_access_rate'
     if len(args.damos_age) > nr_schemes:
-        return [], 'too much --damos_age'
+        return 'too much --damos_age'
     if len(args.damos_apply_interval) > nr_schemes:
-        return [], 'too much --damos_apply_interval'
+        return 'too much --damos_apply_interval'
     if len(args.damos_quotas) > nr_schemes:
-        return [], 'too much --damos_quotas'
+        return 'too much --damos_quotas'
+
     if len(args.damos_quota_goal) > 0 and nr_schemes > 1:
         if len(args.damos_nr_quota_goals) == 0:
-            return [], '--damos_nr_quota_goals required'
+            return '--damos_nr_quota_goals required'
     if nr_schemes == 1 and args.damos_nr_quota_goals == []:
         args.damos_nr_quota_goals = [len(args.damos_quota_goal)]
     if sum(args.damos_nr_quota_goals) != len(args.damos_quota_goal):
-        return [], 'wrong --damos_nr_quota_goals'
+        return 'wrong --damos_nr_quota_goals'
+
     if len(args.damos_wmarks) > nr_schemes:
-        return [], 'too much --damos_wmarks'
+        return 'too much --damos_wmarks'
+
     # for multiple schemes, number of filters per scheme is required
     if len(args.damos_filter) > 0 and nr_schemes > 1:
         if len(args.damos_nr_filters) == 0:
-            return [], '--damos_nr_filters required'
+            return '--damos_nr_filters required'
     if nr_schemes == 1 and args.damos_nr_filters == []:
         args.damos_nr_filters = [len(args.damos_filter)]
     if sum(args.damos_nr_filters) != len(args.damos_filter):
-        return [], 'wrong --damos_nr_filters'
+        return 'wrong --damos_nr_filters'
+
+    if len(args.damos_max_nr_snapshots) > nr_schemes:
+        return 'too much --damos_max_nr_snapshots'
+    return None
+
+def fillup_default_damos_args(args):
+    nr_schemes = len(args.damos_action)
 
     args.damos_sz_region += [['min', 'max']] * (
             nr_schemes - len(args.damos_sz_region))
@@ -382,33 +424,40 @@ def damos_options_to_schemes(args):
             nr_schemes - len(args.damos_apply_interval))
     args.damos_quotas += [None] * (nr_schemes - len(args.damos_quotas))
     args.damos_wmarks += [None] * (nr_schemes - len(args.damos_wmarks))
-    target_nid = [None] * nr_schemes
-    dests_list = []
-    for i in range(nr_schemes):
-        dests_list.append([])
+    args.damos_max_nr_snapshots += [None] * (
+            nr_schemes - len(args.damos_max_nr_snapshots))
+
+def damos_options_to_schemes(args):
+    set_args_damos_quotas(args)
+    err = verify_set_damos_args_len(args)
+    if err is not None:
+        return [], err
+    fillup_default_damos_args(args)
+    nr_schemes = len(args.damos_action)
+
     schemes = []
 
     for i in range(nr_schemes):
         action = args.damos_action[i][0]
+        target_nid = None
+        dests = []
         if _damon.is_damos_migrate_action(action):
             try:
                 if len(args.damos_action[i]) == 2:
-                    target_nid[i] = int(args.damos_action[i][1])
-                    args.damos_action[i] = args.damos_action[i][0]
+                    target_nid = int(args.damos_action[i][1])
                 elif len(args.damos_action[i]) > 2:
                     dests = []
                     for j in range(1, len(args.damos_action[i]), 2):
                         dests.append(_damon.DamosDest(
                             args.damos_action[i][j],
                             args.damos_action[i][j + 1]))
-                    dests_list[i] = dests
-                    args.damos_action[i] = args.damos_action[i][0]
             except:
                 return [], '"%s" action require a numeric target_nid ' \
                         'or dests arguments.' \
                             % args.damos_action[i][0]
-        else:
-            args.damos_action[i] = action
+        elif len(args.damos_action[i]) > 1:
+            return [], 'Wrong number of --damos_action arguments.' % action
+        args.damos_action[i] = action
 
         qgoals = []
         if args.damos_quota_goal:
@@ -426,7 +475,7 @@ def damos_options_to_schemes(args):
                 args.damos_access_rate[i], args.damos_age[i],
                 args.damos_action[i], args.damos_apply_interval[i],
                 args.damos_quotas[i], qgoals, args.damos_wmarks[i],
-                target_nid[i], filters, dests_list[i])
+                target_nid, filters, dests, args.damos_max_nr_snapshots[i])
         if err != None:
             return [], err
         schemes.append(scheme)
@@ -454,11 +503,88 @@ def damon_target_for(args, idx, ops):
         return None, err
 
     try:
-        target = _damon.DamonTarget(args.target_pid[idx]
-                if _damon.target_has_pid(ops) else None, init_regions)
+        obsolete = False
+        if args.obsolete_targets is not None and idx in args.obsolete_targets:
+            obsolete = True
+        target = _damon.DamonTarget(
+                args.target_pid[idx] if _damon.target_has_pid(ops) else None,
+                init_regions, obsolete=obsolete)
     except Exception as e:
-        return 'Wrong \'--target_pid\' argument (%s)' % e
+        return None, 'Wrong \'--target_pid\' argument (%s)' % e
     return target, None
+
+def sample_control_to_ops_attrs_args(args, idx):
+    sample_primitives = args.sample_primitives[idx]
+    if sample_primitives is None:
+        return None
+    ops_use_reports = args.exp_ops_use_reports[idx]
+    if sample_primitives is not None and ops_use_reports is not None:
+        return '--sample_primitives and --exp_ops_use_reports used together'
+    if sample_primitives == ['page_table']:
+        args.exp_ops_use_reports[idx] = 'N'
+    elif sample_primitives == ['page_fault']:
+        args.exp_ops_use_reports[idx] = 'Y'
+    else:
+        return '--sample_primitives of %s is not supported for now' % \
+                sample_primitives
+
+def build_sample_control_ops_attrs(args, idx):
+    '''
+    Returns DamonSampleControl, OpsAttrs, and an error
+    '''
+    err = sample_control_to_ops_attrs_args(args, idx)
+    if err is not None:
+        return None, None, err
+    if args.exp_ops_use_reports[idx] is not None:
+        use_reports = args.exp_ops_use_reports[idx]
+    else:
+        use_reports = False
+    if args.exp_ops_write_only[idx] is not None:
+        write_only = args.exp_ops_write_only[idx]
+    else:
+        write_only = False
+    if args.exp_ops_cpus[idx] is not None:
+        cpus = args.exp_ops_cpus[idx]
+    else:
+        cpus = 'all'
+    if args.exp_ops_tids[idx] is not None:
+        tids = args.exp_ops_tids[idx]
+    else:
+        tids = ''
+    use_sample_control = _damo_sysinfo.damon_sysfs_feature_available(
+            'damon_sample_control')
+    if use_sample_control is False:
+        try:
+            ops_attrs = _damon.OpsAttrs(
+                    use_reports=use_reports, write_only=write_only, cpus=cpus,
+                    tids=tids)
+        except Exception as e:
+            return None, None, 'invalid ops_attrs arguments (%s)' % e
+        return None, ops_attrs, None
+
+    if use_reports:
+        page_table, page_fault = False, True
+    else:
+        page_table, page_fault = True, False
+    primitives_enabled = _damon.DamonPrimitivesEnabled(
+            page_table=page_table, page_fault=page_fault)
+    sample_filters = []
+    if write_only:
+        sample_filters.append(_damon.DamonSampleFilter(
+            filter_type=_damon.damon_filter_type_write, matching=True,
+            allow=True))
+    if cpus != 'all':
+        sample_filters.append(_damon.DamonSampleFilter(
+            filter_type=_damon.damon_filter_type_cpumask, matching=True,
+            allow=True, cpumask=cpus))
+    if tids != '':
+        sample_filters.append(_damon.DamonSampleFilter(
+            filter_type=_damon.damon_filter_type_threads, matching=True,
+            allow=True, tid_arr=tids))
+    sample_control = _damon.DamonSampleControl(
+            primitives_enabled=primitives_enabled,
+            sample_filters=sample_filters)
+    return sample_control, None, None
 
 def damon_ctx_for(args, idx):
     if args.ops[idx] is None:
@@ -481,32 +607,14 @@ def damon_ctx_for(args, idx):
     except Exception as e:
         return None, 'invalid nr_regions arguments (%s)' % e
     ops = args.ops[idx]
-    if args.exp_ops_use_reports[idx] is not None:
-        use_reports = args.exp_ops_use_reports[idx]
-    else:
-        use_reports = False
-    if args.exp_ops_write_only[idx] is not None:
-        write_only = args.exp_ops_write_only[idx]
-    else:
-        write_only = False
-    if args.exp_ops_cpus[idx] is not None:
-        cpus = args.exp_ops_cpus[idx]
-    else:
-        cpus = 'all'
-    if args.exp_ops_tids[idx] is not None:
-        tids = args.exp_ops_tids[idx]
-    else:
-        tids = ''
-    try:
-        ops_attrs = _damon.OpsAttrs(
-                use_reports=use_reports, write_only=write_only, cpus=cpus,
-                tids=tids)
-    except Exception as e:
-        return None, 'invalid ops_attrs arguments (%s)' % e
+    sample_control, ops_attrs, err = build_sample_control_ops_attrs(args, idx)
+    if err is not None:
+        return None, 'exp_ops_* handling fail (%s)' % err
 
     try:
-        ctx = _damon.DamonCtx(ops, None, intervals, nr_regions, schemes=[],
-                              ops_attrs=ops_attrs)
+        ctx = _damon.DamonCtx(
+                ops, None, intervals, nr_regions, schemes=[],
+                sample_control=sample_control, ops_attrs=ops_attrs)
         return ctx, None
     except Exception as e:
         return None, 'Creating context from arguments failed (%s)' % e
@@ -541,12 +649,11 @@ def fillup_none_ctx_args(args):
             'ops', 'exp_ops_use_reports', 'exp_ops_write_only', 'exp_ops_cpus',
             'exp_ops_tids', 'sample', 'aggr', 'updr', 'minr', 'maxr',
             'monitoring_intervals', 'monitoring_intervals_goal',
-            'monitoring_nr_regions_range']:
+            'monitoring_nr_regions_range', 'sample_primitives']:
         attr_val = getattr(args, attr_name)
         if attr_val is None:
             setattr(args, attr_name, [None] * nr_ctxs)
         elif len(attr_val) < nr_ctxs:
-            print(attr_name, attr_val)
             setattr(args, attr_name,
                     attr_val + [None] * (nr_ctxs - len(attr_val)))
 
@@ -561,8 +668,18 @@ def fillup_none_target_args(args):
             setattr(args, attr_name,
                     attr_val + [None] * (nr_targets - len(attr_val)))
 
+def valid_obsolete_targets_args(obsolete_targets, nr_targets):
+    if obsolete_targets is None:
+        return True
+    for target_idx in obsolete_targets:
+        if target_idx >= nr_targets:
+            return False
+    return True
+
 def gen_assign_targets(ctxs, args):
     nr_targets = get_nr_targets(args)
+    if not valid_obsolete_targets_args(args.obsolete_targets, nr_targets):
+        return 'Invalid --obsolete_targets'
     targets = []
     if args.nr_targets is None:
         if len(ctxs) != 1:
@@ -575,7 +692,7 @@ def gen_assign_targets(ctxs, args):
                 break
         target, err = damon_target_for(args, idx, ops)
         if err is not None:
-            return None, err
+            return err
         targets.append(target)
     if sum(args.nr_targets) != len(targets):
         return '--nr_targets and number of targets mismatch (%d != %d)' % (
@@ -805,12 +922,49 @@ def stage_kdamonds(args):
         return None, 'cannot apply kdamonds from args (%s)' % err
     return kdamonds, None
 
+def damos_filter_invalidity(filter):
+    # todo: support non-memcg filters
+    if filter.filter_type != 'memcg':
+        return None
+    memcg_path = filter.memcg_path
+    if not memcg_path.startswith('/'):
+        return 'path should start with "/"'
+    cgroup_mount_path = None
+    with open('/proc/mounts', 'r') as f:
+        for line in f:
+            fields = line.split()
+            if not fields[2] in ['cgroup', 'cgroup2']:
+                continue
+            cgroup_mount_path = fields[1]
+            break
+    if cgroup_mount_path is None:
+        return 'cgroup is not mounted'
+    memcg_realpath = os.path.join(cgroup_mount_path, memcg_path[1:])
+    if not os.path.isdir(memcg_realpath):
+        return '%s not found' % memcg_realpath
+    return None
+
+def infer_start_or_commit_fail_reason(kdamonds):
+    for kidx, kd in enumerate(kdamonds):
+        for cidx, ctx in enumerate(kd.contexts):
+            for sidx, scheme in enumerate(ctx.schemes):
+                for fidx, filter in enumerate(scheme.filters):
+                    reason = damos_filter_invalidity(filter)
+                    if reason is not None:
+                        return ''.join([
+                            'wrong %d/%d/%d/%d-th ' % (kidx, cidx, sidx, fidx),
+                            'kdamond/context/scheme/filter (%s)' % reason])
+    return None
+
 def commit_kdamonds(args, commit_quota_goals_only):
     kdamonds, err = kdamonds_for(args)
     if err:
         return None, 'cannot create kdamonds to commit from args (%s)' % err
     err = _damon.commit(kdamonds, commit_quota_goals_only)
     if err:
+        inferred_reason = infer_start_or_commit_fail_reason(kdamonds)
+        if inferred_reason is not None:
+            err = '%s (%s)' % (err, inferred_reason)
         return None, 'cannot commit kdamonds (%s)' % err
     return kdamonds, None
 
@@ -818,8 +972,14 @@ def turn_damon_on(args):
     kdamonds, err = stage_kdamonds(args)
     if err:
         return err, None
-    return _damon.turn_damon_on(
-            ['%s' % kidx for kidx, k in enumerate(kdamonds)]), kdamonds
+    err = _damon.turn_damon_on(
+            ['%s' % kidx for kidx, k in enumerate(kdamonds)])
+    if err is not None:
+        inferred_reason = infer_start_or_commit_fail_reason(kdamonds)
+        if inferred_reason is not None:
+            err = '%s (%s)' % (err, inferred_reason)
+        return err, None
+    return None, kdamonds
 
 # Commandline options setup helpers
 
@@ -871,6 +1031,10 @@ def set_monitoring_attrs_argparser(parser, hide_help=False):
                         metavar=('<min>', '<max>'), action='append',
                         help='min/max number of monitoring regions'
                         if not hide_help else argparse.SUPPRESS)
+    parser.add_argument('--sample_primitives', action='append',
+                        choices=['page_table', 'page_fault'], nargs='+',
+                        help='access sampling primitives to use'
+                        if not hide_help else argparse.SUPPRESS)
 
 def set_monitoring_damos_common_args(parser, hide_help=False):
     parser.add_argument('--ops', choices=['vaddr', 'paddr', 'fvaddr'],
@@ -914,6 +1078,10 @@ def set_monitoring_argparser(parser, hide_help=False):
             '--nr_targets', metavar='<number>', nargs='+', type=int,
             help='number of monitoring targets for each context (in order)'
             if not hide_help else argparse.SUPPRESS)
+    parser.add_argument('--obsolete_targets', metavar='<target index>',
+                        nargs='+', type=int,
+                        help='obsolte targets'
+                        if not hide_help else argparse.SUPPRESS)
     parser.add_argument('--nr_ctxs', metavar='<number>', nargs='+', type=int,
                         help='number of contexts for each kdamond (in order)'
                         if not hide_help else argparse.SUPPRESS)
@@ -1004,6 +1172,9 @@ def set_damos_argparser(parser, hide_help):
                 '<low mark (permil)>'),
             help='damos watermarks'
             if not hide_help else argparse.SUPPRESS)
+    parser.add_argument(
+            '--damos_max_nr_snapshots', action='append', default=[],
+            help='damos max_nr_snapshots')
     parser.add_argument('--nr_schemes', metavar='<number>', nargs='+', type=int,
                         help='number of schemes for each context (in order)'
                         if not hide_help else argparse.SUPPRESS)

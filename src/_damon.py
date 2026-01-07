@@ -13,7 +13,6 @@ import subprocess
 import time
 
 import _damo_fmt_str
-import damo_version
 
 # Core data structures
 
@@ -185,6 +184,145 @@ class DamonNrRegionsRange:
             ('max', _damo_fmt_str.format_nr(self.maximum, raw)),
             ])
 
+damon_filter_type_cpumask = 'cpumask'
+damon_filter_type_threads = 'threads'
+damon_filter_type_write = 'write'
+
+class DamonSampleFilter:
+    filter_type = None
+    matching = None
+    allow = None
+    cpumask = None # the kernel-accepting cpumask string or None
+    tid_arr = None # the kernel-accepting integer array string or None
+
+    def __init__(self, filter_type, matching, allow, cpumask=None,
+                 tid_arr=None):
+        self.filter_type = filter_type
+        self.matching = matching
+        self.allow = allow
+        self.cpumask = cpumask
+        self.tid_arr = tid_arr
+
+    def to_str(self, raw):
+        words = []
+        if self.allow:
+            words.append('allow')
+        else:
+            words.append('reject')
+        if self.matching is False:
+            words.append('none')
+        words.append(self.filter_type)
+        if self.filter_type == damon_filter_type_cpumask:
+            words.append(self.cpumask)
+        elif self.filter_type == damon_filter_type_threads:
+            words.append(self.tid_arr)
+        return ' '.join(words)
+
+    def __str__(self):
+        return self.to_str(False)
+
+    def __eq__(self, other):
+        return type(self) == type(other) and \
+                self.filter_type == other.filter_type and \
+                self.matching == other.matching and \
+                self.allow == other.allow and \
+                self.cpumask == other.cpumask and self.tid_arr == other.tid_arr
+
+    @classmethod
+    def from_kvpairs(cls, kv):
+        return DamonSampleFilter(
+                filter_type=kv['filter_type'], matching=kv['matching'],
+                allow=kv['allow'], cpumask=kv['cpumask'],
+                tid_arr=kv['tid_arr'])
+
+    def to_kvpairs(self, raw=False):
+        return collections.OrderedDict([
+            ('filter_type', self.filter_type),
+            ('matching', self.matching),
+            ('allow', self.allow),
+            ('cpumask', self.cpumask),
+            ('tid_arr', self.tid_arr),
+            ])
+
+class DamonPrimitivesEnabled:
+    page_table = None
+    page_fault = None
+
+    def __init__(self, page_table=True, page_fault=False):
+        self.page_table = _damo_fmt_str.text_to_bool(page_table)
+        self.page_fault = _damo_fmt_str.text_to_bool(page_fault)
+
+    def to_str(self, raw):
+        words = []
+        if self.page_table is True:
+            words.append('page_table')
+        if self.page_fault is True:
+            words.append('page_fault')
+        return ', '.join(words)
+
+    def __str__(self):
+        return self.to_str(False)
+
+    def __eq__(self, other):
+        return type(self) == type(other) and \
+                self.page_table == other.page_table and \
+                self.page_fault == other.page_fault
+
+    @classmethod
+    def from_kvpairs(cls, kv):
+        return DamonPrimitivesEnabled(
+                page_table=kv['page_table'], page_fault=kv['page_fault'])
+
+    def to_kvpairs(self, raw=False):
+        return collections.OrderedDict([
+            ('page_table', self.page_table),
+            ('page_fault', self.page_fault),
+            ])
+
+class DamonSampleControl:
+    primitives_enabled = None
+    sample_filters = None
+
+    def __init__(self, primitives_enabled=None, sample_filters=None):
+        if primitives_enabled is None:
+            primitives_enabled = DamonPrimitivesEnabled()
+        if sample_filters is None:
+            sample_filters = []
+        self.primitives_enabled = primitives_enabled
+        self.sample_filters = sample_filters
+
+    def to_str(self, raw):
+        lines = [
+                'enabled primitives: %s' % self.primitives_enabled.to_str(raw)]
+        if len(self.sample_filters) > 0:
+            lines.append('Filters')
+            for filter in self.sample_filters:
+                lines.append('- %s' % filter.to_str(raw))
+        return '\n'.join(lines)
+
+    def __str__(self):
+        return self.to_str(False)
+
+    def __eq__(self, other):
+        return type(self) == type(other) and \
+                self.primitives_enabled == other.primitives_enabled and \
+                self.sample_filters == other.sample_filters
+
+    @classmethod
+    def from_kvpairs(cls, kv):
+        return DamonSampleControl(
+                primitives_enabled=DamonPrimitivesEnabled.from_kvpairs(
+                    kv['primitives_enabled']),
+                sample_filters=[DamonSampleFilter.from_kvpairs(kvpairs)
+                                for kvpairs in kv['sample_filters']])
+
+    def to_kvpairs(self, raw=False):
+        return collections.OrderedDict([
+            ('primitives_enabled', self.primitives_enabled.to_kvpairs(raw)),
+            ('sample_filters', [
+                f.to_kvpairs(raw) for f in self.sample_filters]),
+            ])
+
 unit_percent = 'percent'
 unit_samples = 'samples'
 unit_usec = 'usec'
@@ -283,6 +421,8 @@ class DamonAge:
     def to_str(self, unit, raw):
         if unit == unit_usec:
             return _damo_fmt_str.format_time_us_exact(self.usec, raw)
+        if self.aggr_intervals is None:
+            return 'unkown %s' % unit_aggr_intervals
         return '%s %s' % (_damo_fmt_str.format_nr(self.aggr_intervals, raw),
                 unit_aggr_intervals)
 
@@ -351,8 +491,7 @@ class DamonRegion:
         return self.to_str(False)
 
     def __eq__(self, other):
-        if self.nr_accesses == None:
-            return type(self) == type(other) and '%s' % self == '%s' % other
+        return type(self) == type(other) and '%s' % self == '%s' % other
 
     # For aggregate_snapshots() support
     def __hash__(self):
@@ -393,17 +532,21 @@ class DamonRegion:
 
 class DamonTarget:
     pid = None
+    obsolete = None
     regions = None
     context = None
 
-    def __init__(self, pid, regions):
+    def __init__(self, pid, regions=[], obsolete=False):
         self.pid = pid
         self.regions = regions
+        self.obsolete = _damo_fmt_str.text_to_bool(obsolete)
 
     def to_str(self, raw):
         lines = []
         if self.pid is not None:
             lines.append('pid: %s' % self.pid)
+        if self.obsolete is True:
+            line.sappend('(obsolete)')
         for region in self.regions:
             lines.append('region %s' % region.to_str(raw))
         return '\n'.join(lines)
@@ -417,11 +560,15 @@ class DamonTarget:
     @classmethod
     def from_kvpairs(cls, kvpairs):
         regions = [DamonRegion.from_kvpairs(kvp) for kvp in kvpairs['regions']]
-        return DamonTarget(kvpairs['pid'], regions)
+        obsolete = False
+        if 'obsolete' in kvpairs:
+            obsolete = kvpairs['obsolete']
+        return DamonTarget(kvpairs['pid'], regions, obsolete=obsolete)
 
     def to_kvpairs(self, raw=False):
         kvp = collections.OrderedDict()
         kvp['pid'] = self.pid
+        kvp['obsolete'] = self.obsolete
         kvp['regions'] = [r.to_kvpairs(raw) for r in self.regions]
         return kvp
 
@@ -573,10 +720,13 @@ qgoal_user_input = 'user_input'
 qgoal_some_mem_psi_us = 'some_mem_psi_us'
 qgoal_node_mem_used_bp = 'node_mem_used_bp'
 qgoal_node_mem_free_bp = 'node_mem_free_bp'
+qgoal_node_memcg_used_bp = 'node_memcg_used_bp'
+qgoal_node_memcg_free_bp = 'node_memcg_free_bp'
 qgoal_active_mem_bp = 'active_mem_bp'
 qgoal_inactive_mem_bp = 'inactive_mem_bp'
 qgoal_metrics = [qgoal_user_input, qgoal_some_mem_psi_us,
                  qgoal_node_mem_used_bp, qgoal_node_mem_free_bp,
+                 qgoal_node_memcg_used_bp, qgoal_node_memcg_free_bp,
                  qgoal_active_mem_bp, qgoal_inactive_mem_bp]
 
 class DamosQuotaGoal:
@@ -584,16 +734,19 @@ class DamosQuotaGoal:
     target_value = None
     current_value = None
     nid = None
+    memcg_path = None
     quotas = None
 
     def __init__(self, metric=qgoal_user_input,
-                 target_value='0', current_value='0', nid=None):
+                 target_value='0', current_value='0', nid=None,
+                 memcg_path=None):
         if not metric in qgoal_metrics:
             raise Exception('unsupported DAMOS quota goal metric')
         self.metric = metric
         if metric == qgoal_some_mem_psi_us:
             self.target_value = _damo_fmt_str.text_to_us(target_value)
         elif metric in [qgoal_node_mem_used_bp, qgoal_node_mem_free_bp,
+                        qgoal_node_memcg_used_bp, qgoal_node_memcg_free_bp,
                         qgoal_active_mem_bp, qgoal_inactive_mem_bp]:
             self.target_value = _damo_fmt_str.text_to_bp(target_value)
         else:
@@ -603,6 +756,7 @@ class DamosQuotaGoal:
             self.nid = None
         else:
             self.nid = _damo_fmt_str.text_to_nr(nid)
+        self.memcg_path = memcg_path
 
     @classmethod
     def metric_require_nid(cls, metric):
@@ -611,11 +765,24 @@ class DamosQuotaGoal:
     def has_nid(self):
         return DamosQuotaGoal.metric_require_nid(self.metric)
 
+    @classmethod
+    def metric_require_memcg_path(cls, metric):
+        return metric in [qgoal_node_memcg_used_bp, qgoal_node_memcg_free_bp]
+
+    def has_memcg_path(self):
+        return DamosQuotaGoal.metric_require_memcg_path(self.metric)
+
     def to_str(self, raw):
         metric_str = self.metric
+        additional_words = []
         if self.has_nid():
-            metric_str = '%s (nid %s)' % (
-                    metric_str, _damo_fmt_str.format_nr(self.nid, raw))
+            additional_words.append('nid %s' %
+                                    _damo_fmt_str.format_nr(self.nid, raw))
+        if self.has_memcg_path():
+            additional_words.append('memcg %s' % self.memcg_path)
+
+        if len(additional_words) > 0:
+            metric_str = '%s (%s)' % (metric_str, ', '.join(additional_words))
         return 'metric %s target %s current %s' % (
                 metric_str,
                 _damo_fmt_str.format_nr(self.target_value, raw),
@@ -627,6 +794,7 @@ class DamosQuotaGoal:
     def __eq__(self, other):
         return (type(self) == type(other) and self.metric == other.metric and
                 self.nid == other.nid and
+                self.memcg_path == other.memcg_path and
                 self.target_value == other.target_value and
                 self.current_value == other.current_value)
 
@@ -637,8 +805,13 @@ class DamosQuotaGoal:
             # later.
             return DamosQuotaGoal(target_value=kv['target_value_bp'],
                                   current_value=kv['current_value_bp'])
+        if 'memcg_path' in kv:
+            memcg_path = kv['memcg_path']
+        else:
+            memcg_path = None
         return DamosQuotaGoal(
                 metric=kv['metric'], nid=kv['nid'] if 'nid' in kv else None,
+                memcg_path=memcg_path,
                 target_value=kv['target_value'],
                 current_value=kv['current_value'])
 
@@ -647,6 +820,7 @@ class DamosQuotaGoal:
             ('metric', self.metric),
             ('nid', _damo_fmt_str.format_nr(self.nid, raw)
              if self.nid is not None else None),
+            ('memcg_path', self.memcg_path),
             ('target_value', _damo_fmt_str.format_nr(self.target_value,
                 raw)),
             ('current_value', _damo_fmt_str.format_nr(self.current_value,
@@ -917,9 +1091,12 @@ class DamosStats:
     sz_applied = None
     sz_ops_filter_passed = None
     qt_exceeds = None
+    nr_snapshots = None
+    max_nr_snapshots = None
 
     def __init__(self, nr_tried=0, sz_tried=0, nr_applied=0, sz_applied=0,
-                 sz_ops_filter_passed=0, qt_exceeds=0):
+                 sz_ops_filter_passed=0, qt_exceeds=0, nr_snapshots=0,
+                 max_nr_snapshots=0):
         self.nr_tried = _damo_fmt_str.text_to_nr(nr_tried)
         self.sz_tried = _damo_fmt_str.text_to_bytes(sz_tried)
         self.nr_applied = _damo_fmt_str.text_to_nr(nr_applied)
@@ -927,6 +1104,8 @@ class DamosStats:
         self.sz_ops_filter_passed = _damo_fmt_str.text_to_bytes(
                 sz_ops_filter_passed)
         self.qt_exceeds = _damo_fmt_str.text_to_nr(qt_exceeds)
+        self.nr_snapshots = _damo_fmt_str.text_to_nr(nr_snapshots)
+        self.max_nr_snapshots = _damo_fmt_str.text_to_nr(max_nr_snapshots)
 
     def to_str(self, raw):
         return '\n'.join([
@@ -938,7 +1117,12 @@ class DamosStats:
                 _damo_fmt_str.format_sz(self.sz_applied, raw)),
             '%s passed filters' %
             _damo_fmt_str.format_sz(self.sz_ops_filter_passed, raw),
-            'quota exceeded %d times' % self.qt_exceeds,
+            'quota exceeded %s times' %
+            _damo_fmt_str.format_nr(self.qt_exceeds, raw),
+            _damo_fmt_str.format_sz(self.sz_ops_filter_passed, raw),
+            'tried %s snapshots (max %s)' %
+            (_damo_fmt_str.format_nr(self.nr_snapshots, raw),
+             _damo_fmt_str.format_nr(self.max_nr_snapshots, raw)),
             ])
 
     def __str__(self):
@@ -953,13 +1137,26 @@ class DamosStats:
         kv['sz_ops_filter_passed'] = _damo_fmt_str.format_sz(
                 self.sz_ops_filter_passed, raw)
         kv['qt_exceeds'] = _damo_fmt_str.format_nr(self.qt_exceeds, raw)
+        kv['nr_snapshots'] = _damo_fmt_str.format_nr(self.nr_snapshots, raw)
+        kv['max_nr_snapshots'] = _damo_fmt_str.format_nr(
+                self.max_nr_snapshots, raw)
         return kv
 
     @classmethod
     def from_kvpairs(cls, kv):
+        if 'nr_snapshots' in kv:
+            nr_snapshots = kv['nr_snapshots']
+        else:
+            nr_snapshots = 0
+        if 'max_nr_snapshots' in kv:
+            max_nr_snapshots = kv['max_nr_snapshots']
+        else:
+            max_nr_snapshots = 0
         return cls(kv['nr_tried'], kv['sz_tried'],
                    kv['nr_applied'], kv['sz_applied'],
-                   kv['sz_ops_filter_passed'], kv['qt_exceeds'])
+                   kv['sz_ops_filter_passed'], kv['qt_exceeds'],
+                   nr_snapshots=nr_snapshots,
+                   max_nr_snapshots=max_nr_snapshots)
 
 # TODO: check support of pageout and lru_(de)prio
 damos_actions = [
@@ -1053,7 +1250,7 @@ class Damos:
             if self.apply_interval_us != 0 else 'per aggr interval')
         return ' '.join(action_words)
 
-    def to_str(self, raw, params_only=False):
+    def to_str(self, raw, params_only=False, omit_tried_regions=False):
         lines = [self.str_action_line(raw)]
         if self.access_pattern is not None:
             lines.append('target access pattern')
@@ -1076,7 +1273,8 @@ class Damos:
         if params_only is False and self.stats is not None:
             lines.append('statistics')
             lines.append(_damo_fmt_str.indent_lines(self.stats.to_str(raw), 4))
-        if params_only is False and self.tried_regions is not None:
+        if params_only is False and omit_tried_regions is False and \
+                self.tried_regions is not None:
             lines.append('tried regions (%s)' % _damo_fmt_str.format_sz(
                     self.tried_bytes, raw))
             for region in self.tried_regions:
@@ -1160,11 +1358,13 @@ class DamonCtx:
     targets = None
     intervals = None
     nr_regions = None
+    sample_control = None
     schemes = None
     kdamond = None
 
     def __init__(self, ops='paddr', targets=None, intervals=None,
-                 nr_regions=None, schemes=None, ops_attrs=None):
+                 nr_regions=None, schemes=None, ops_attrs=None,
+                 sample_control=None):
         self.ops = ops
         self.ops_attrs = ops_attrs if ops_attrs is not None else OpsAttrs()
         self.targets = targets if targets is not None else []
@@ -1174,11 +1374,14 @@ class DamonCtx:
                           if intervals is not None else DamonIntervals())
         self.nr_regions = (nr_regions if nr_regions is not None
                            else DamonNrRegionsRange())
+        if sample_control is None:
+            sample_control = DamonSampleControl()
+        self.sample_control = sample_control
         self.schemes = schemes if schemes is not None else Damos()
         for scheme in self.schemes:
             scheme.context = self
 
-    def to_str(self, raw, params_only=False):
+    def to_str(self, raw, params_only=False, omit_damos_tried_regions=False):
         ops_line_tokens = ['ops: %s' % self.ops]
         if self.ops_attrs.use_reports:
             ops_line_tokens.append('use_reports')
@@ -1201,7 +1404,9 @@ class DamonCtx:
         for idx, scheme in enumerate(self.schemes):
             lines.append('scheme %d' % idx)
             lines.append(_damo_fmt_str.indent_lines(
-                scheme.to_str(raw, params_only), 4))
+                scheme.to_str(raw, params_only, omit_damos_tried_regions), 4))
+        lines.append('access sample control')
+        lines.append('%s' % self.sample_control.to_str(raw))
         return '\n'.join(lines)
 
     def __str__(self):
@@ -1215,15 +1420,21 @@ class DamonCtx:
 
     @classmethod
     def from_kvpairs(cls, kv):
+        if 'sample_control' in kv:
+            sample_control = DamonSampleControl.from_kvpairs(
+                    kv['sample_control'])
+        else:
+            sample_control = DamonSampleControl()
         ctx = DamonCtx(
                 kv['ops'],
                 [DamonTarget.from_kvpairs(t) for t in kv['targets']],
                 DamonIntervals.from_kvpairs(kv['intervals'])
                     if 'intervals' in kv else DamonIntervals(),
                 DamonNrRegionsRange.from_kvpairs(kv['nr_regions'])
-                    if 'nr_regions' in kv else DAmonNrRegionsRange(),
+                    if 'nr_regions' in kv else DamonNrRegionsRange(),
                 [Damos.from_kvpairs(s) for s in kv['schemes']]
-                    if 'schemes' in kv else [])
+                    if 'schemes' in kv else [],
+                sample_control=sample_control)
         return ctx
 
     def to_kvpairs(self, raw=False, omit_defaults=False, params_only=False):
@@ -1234,12 +1445,16 @@ class DamonCtx:
             kv['intervals'] = self.intervals.to_kvpairs(raw)
         if not omit_defaults or self.nr_regions != DamonNrRegionsRange():
             kv['nr_regions'] = self.nr_regions.to_kvpairs(raw)
+        kv['sample_control'] = self.sample_control.to_kvpairs(raw)
         kv['schemes'] = [s.to_kvpairs(raw, omit_defaults, params_only)
                          for s in self.schemes]
         return kv
 
 def target_has_pid(ops):
     return ops in ['vaddr', 'fvaddr']
+
+def target_regions_fixed(ops):
+    return ops in ['fvaddr', 'paddr']
 
 class Kdamond:
     state = None
@@ -1270,7 +1485,8 @@ class Kdamond:
             words.append('cpu usage: %s' % self.get_cpu_usage())
         return ', '.join(words)
 
-    def to_str(self, raw, show_cpu=False, params_only=False):
+    def to_str(self, raw, show_cpu=False, params_only=False,
+               omit_damos_tried_regions=False):
         lines = []
         summary_line = self.summary_str(show_cpu, params_only,
                                         omit_defaults=False, raw_number=raw)
@@ -1279,7 +1495,7 @@ class Kdamond:
         for idx, ctx in enumerate(self.contexts):
             lines.append('context %d' % idx)
             lines.append(_damo_fmt_str.indent_lines(
-                ctx.to_str(raw, params_only), 4))
+                ctx.to_str(raw, params_only, omit_damos_tried_regions), 4))
         return '\n'.join(lines)
 
     def __str__(self):
@@ -1320,78 +1536,9 @@ class Kdamond:
         return kv
 
 import _damo_fs
+import _damo_sysinfo
 import _damon_dbgfs
 import _damon_sysfs
-import damo_version
-
-# System check
-
-# damo supports all DAMON-enabled kernels.  For that, damo maintains list of
-# the DAMON features, and a dict saying whether the feature is supported on the
-# running kernel.  Since the supports depend on underlying DAMON interface, the
-# dict is populated by _damon_fs, and saved as _damon_fs.feature_supports.
-#
-# The feature_supports population cannot be fully done while DAMON is running,
-# particularly in case of debugfs.  Specifically, it has to do writing some
-# values to some files and check if it success or fails.  While DAMON is
-# running, such writing may always fail (-EBUSY).  Sysfs is ok for now since it
-# allows writing files while DAMON is running, except 'state' file.  But,
-# similar issue could happen in future.
-#
-# Hence, damo features for online DAMON control or snapshot cannot make
-# feature_supprots correctly.  And repeated feature check is waste of time,
-# anyway.
-#
-# To work around, ask features that would run while DAMON is not running to
-# build the feature_supports dict, and write on feature_supports_file_path
-# file.  If the file already exists and valid, other damo features that depends
-# on feature_supports setup feature_supports dict by reading it from the file.
-# Specifically, ensure_initialized() receives the save/load request as
-# arguments.
-
-features = ['record',       # was in DAMON patchset, but not merged in mainline
-            'vaddr',        # merged in v5.15, thebeginning
-            'schemes',      # merged in v5.16
-            'init_regions', # merged in v5.16 (90bebce9fcd6)
-            'paddr',        # merged in v5.16 (a28397beb55b)
-            'schemes_speed_limit',      # merged in v5.16 (2b8a248d5873)
-            'schemes_quotas',           # merged in v5.16 (1cd243030059)
-            'schemes_prioritization',   # merged in v5.16 (38683e003153)
-            'schemes_wmarks',           # merged in v5.16 (ee801b7dd782)
-            'schemes_stat_succ',        # merged in v5.17 (0e92c2ee9f45)
-            'schemes_stat_qt_exceed',   # merged in v5.17 (0e92c2ee9f45)
-            'init_regions_target_idx',  # merged in v5.18 (144760f8e0c3)
-            'fvaddr',       # merged in v5.19 (b82434471cd2)
-            'schemes_tried_regions',    # merged in v6.2-rc1
-            'schemes_filters',          # merged in v6.3-rc1
-            'schemes_filters_anon',     # merged in v6.3-rc1
-            'schemes_filters_memcg',    # merged in v6.3-rc1
-            'schemes_tried_regions_sz', # merged in v6.6-rc1
-            'schemes_filters_addr',     # merged in v6.6-rc1
-            'schemes_filters_target',   # merged in v6.6-rc1
-            'schemes_apply_interval',   # merged in v6.7-rc1
-            'schemes_quota_goals',      # merged in v6.8-rc1
-            'schemes_quota_effective_bytes',    # merged in v6.9-rc1
-            'schemes_quota_goal_metric',    # merged in v6.9-rc1
-            'schemes_quota_goal_some_psi',  # merged in v6.9-rc1
-            'schemes_filters_young',    # merged in v6.10-rc1
-            'schemes_migrate',          # merged in v6.11-rc1
-            'sz_ops_filter_passed',     # merged in v6.14-rc1
-            'allow_filter',             # merged in v6.14-rc1
-            'schemes_filters_hugepage_size',
-                                        # merged in v6.15-rc1
-            'schemes_filters_unmapped', # merged in v6.15-rc1
-            'intervals_goal',           # merged in v6.15-rc1
-            'schemes_filters_core_ops_dirs',
-                                        # merged in v6.15-rc1
-            'schemes_filters_active',
-                                        # merged in v6.15-rc1
-            'schemes_quota_goal_node_mem_used_free',
-                                        # merged in v6.16-rc1
-            'schemes_dests',            # merged in v6.17-rc1
-            'sysfs_refresh_ms',         # merged in v6.17-rc1
-            'ops_attrs',                # hacking on damon/next
-            ]
 
 _damon_fs = None
 
@@ -1400,105 +1547,18 @@ def ensure_root_permission():
         print('Run as root')
         exit(1)
 
-feature_supports_file_path = os.path.join(os.environ['HOME'],
-        '.damo.damon_feature_supports')
-
-# initial version is json format of feature_supports dict.  the version doesn't
-# have file format version at all.
-#
-# Format version 1 file contains feature_supports for debugfs and sysfs, and
-# the version field.
-#
-# Format version 2 file contains the version of the kernel that
-# feature_supports is made on.
-#
-# Format version 3 file contains the version of damo.
-feature_support_file_format_ver = 3
-
-def version_mismatch(feature_supports):
-    if not 'file_format_ver' in feature_supports:
-        file_format_ver = 0
-    else:
-        file_format_ver = feature_supports['file_format_ver']
-    if file_format_ver != feature_support_file_format_ver:
-        return 'unsupported format version %s' % file_format_ver
-    kernel_ver = feature_supports['kernel_version']
-    current_kernel_ver = subprocess.check_output(['uname', '-r']).decode()
-    if kernel_ver != current_kernel_ver:
-        return 'kernel is different from that created %s (%s != %s)' % (
-                feature_supports_file_path, kernel_ver, current_kernel_ver)
-    damo_ver = feature_supports['damo_version']
-    if damo_ver != damo_version.__version__:
-        return 'damo version is different from that created %s (%s != %s)' % (
-                feature_supports_file_path, damo_ver, damo_version.__version__)
-    return None
-
-def read_feature_supports_file():
-    '''Return error string'''
-    if not os.path.isfile(feature_supports_file_path):
-        return '%s not exist' % feature_supports_file_path
-    try:
-        with open(feature_supports_file_path, 'r') as f:
-            feature_supports = json.load(f)
-    except Exception as e:
-        return 'reading feature supports failed (%s)' % e
-
-    err = version_mismatch(feature_supports)
-    if err is not None:
-        return err
-
-    if not damon_interface() in feature_supports:
-        return 'no feature_supports for %s interface saved' % damon_interface()
-    return set_feature_supports(feature_supports[damon_interface()])
-
-def write_feature_supports_file():
-    '''Return error string'''
-    feature_supports, err = get_feature_supports()
-    if err != None:
-        return 'get_feature_supports() failed (%s)' % err
-
-    to_save = {}
-    # if feature supports file has the information for file system that
-    # different from the one current execution is using, keep it.
-    if os.path.isfile(feature_supports_file_path):
-        with open(feature_supports_file_path, 'r') as f:
-            try:
-                to_save = json.load(f)
-            except:
-                # Maybe previous writing was something wrong.  Just overwrite.
-                to_save = {}
-        # if it is written by old version of damo, discard previously written
-        # things.
-        if version_mismatch(to_save) is not None:
-            to_save = {}
-
-    to_save['file_format_ver'] = feature_support_file_format_ver
-    to_save['kernel_version'] = subprocess.check_output(
-            ['uname', '-r']).decode()
-    to_save['damo_version'] = damo_version.__version__
-    to_save[damon_interface()] = feature_supports
-
-    with open(feature_supports_file_path, 'w') as f:
-        json.dump(to_save, f, indent=4, sort_keys=True)
-
 def feature_supported(feature):
-    return _damon_fs.feature_supported(feature)
-
-def get_feature_supports():
-    err = _damon_fs.update_supported_features()
-    if err != None:
-        return None, err
-    return _damon_fs.feature_supports, None
-
-def set_feature_supports(feature_supports):
-    if sorted(features) != sorted(feature_supports.keys()):
-        # The feature_supports_file is old.  E.g., The file has written by old
-        # version of damo, and then being read by new version.
-        # e.g., https://github.com/awslabs/damo/issues/103
-        return 'feature supports file is not updated'
-
-    _damon_fs.feature_supports = feature_supports
-    return None
+    sysinfo, err = _damo_sysinfo.get_sysinfo()
+    if err is not None:
+        raise Exception(
+        'BUG.  Please report on https://github.com/damonitor/damo/issues')
+    if _damon_fs == _damon_sysfs:
+        return feature in [f.name for f in sysinfo.avail_damon_sysfs_features]
+    else:
+        return feature in [
+                f.name for f in sysinfo.avail_damon_debugfs_features]
+    raise Exception(
+            'BUG.  Please report on https://github.com/damonitor/damo/issues')
 
 def set_damon_interface(damon_interface):
     global _damon_fs
@@ -1515,55 +1575,34 @@ def set_damon_interface(damon_interface):
         return 'DAMON interface (%s) not supported' % damon_interface
     return None
 
-def initialize(damon_interface, debug_damon, is_stop):
+def initialize(damon_interface, debug_damon, load_sysinfo):
     err = set_damon_interface(damon_interface)
     if err is not None:
         return err
-
     if debug_damon:
         _damo_fs.debug_print_ops(True)
-
-    # try reading previously saved feature_supports file, to avoid unnecessary
-    # feature check I/O
-    err = read_feature_supports_file()
-    if err is None:
-        return err
-
-    # stop would be called while DAMON is running.  It can success without
-    # knowing features.  Just proceed.
-    if is_stop:
-        return None
-
-    # While DAMON is running, feature checking I/O can fail, corrupt something,
-    # or make something complicated.
-    if any_kdamond_running():
-        return 'feature_supports loading failed (%s), and DAMON is running'
-
-    return write_feature_supports_file()
+    if load_sysinfo:
+        err = _damo_sysinfo.load_sysinfo()
+        if err is not None:
+            return err
+    return None
 
 initialized = False
-def ensure_initialized(args, is_stop):
+def ensure_initialized(args, load_sysinfo):
     global initialized
 
     if initialized:
         return
-    err = initialize(args.damon_interface_DEPRECATED, args.debug_damon,
-                     is_stop)
+    err = initialize(
+            args.damon_interface_DEPRECATED, args.debug_damon, load_sysinfo)
     if err != None:
         print(err)
         exit(1)
     initialized = True
 
-def ensure_root_and_initialized(args, is_stop=False):
+def ensure_root_and_initialized(args, load_sysinfo=True):
     ensure_root_permission()
-    ensure_initialized(args, is_stop)
-
-def damon_interface():
-    if _damon_fs == _damon_sysfs:
-        return 'sysfs'
-    elif _damon_fs == _damon_dbgfs:
-        return 'debugfs'
-    raise Exception('_damo_fs is neither _damon_sysfs nor _damon_dbgfs')
+    ensure_initialized(args, load_sysinfo)
 
 # DAMON control
 
@@ -1584,6 +1623,23 @@ def commit_quota_goals(kdamond_idxs):
     if _damon_fs == _damon_dbgfs:
         return 'debugfs interface does not support commit_quota_goals()'
     return _damon_fs.commit_quota_goals(kdamond_idxs)
+
+def cleanup_obsolete_targets(kdamonds):
+    '''
+    When obsolete targets are committed to DAMON, DAMON removes the obsolete
+    ones inside kernel, but leave the sysfs files as is.  Cleanup the obsolete
+    sysfs files by staging only non-obsolete targets again.
+    '''
+    need_cleanup = False
+    for kd in kdamonds:
+        for ctx in kd.contexts:
+            for target in ctx.targets:
+                if target.obsolete:
+                    need_cleanup = True
+            ctx.targets = [t for t in ctx.targets if not t.obsolete]
+    if not need_cleanup:
+        return None
+    return stage_kdamonds(kdamonds)
 
 def commit(kdamonds, commit_quota_goals_only=False, commit_targets_only=False):
     if not commit_quota_goals_only and not commit_targets_only:
@@ -1606,6 +1662,11 @@ def commit(kdamonds, commit_quota_goals_only=False, commit_targets_only=False):
     err = commit_staged(kdamond_idxs)
     if err:
         return 'commit staged updates filed (%s)' % err
+
+    err = cleanup_obsolete_targets(kdamonds)
+    if err is not None:
+        return 'obsolte targets cleanup failed (%s)' % err
+
     return None
 
 def update_tuned_intervals(kdamond_idxs=None):
@@ -1630,6 +1691,10 @@ def update_schemes_tried_bytes(kdamond_idxs=None):
     return _damon_fs.update_schemes_tried_bytes(kdamond_idxs)
 
 def update_schemes_tried_regions(kdamond_idxs=None):
+    if not feature_supported('schemes_tried_regions'):
+        return 'DAMON feature \'schemes_tried_regions\' is not supported' \
+                ' on the current kernel.  ' \
+                'It is available on kernel version 6.2 and later'
     if kdamond_idxs == None:
         kdamond_idxs = running_kdamond_idxs()
     return _damon_fs.update_schemes_tried_regions(kdamond_idxs)
@@ -1667,6 +1732,99 @@ def update_schemes_status(stats=True, tried_regions=True,
 
     if quota_effective_bytes and feature_supported('schemes_quota_effective_bytes'):
         return update_schemes_quota_effective_bytes(idxs)
+
+    return None
+
+def get_childs_pids(pid):
+    try:
+        childs_pids = subprocess.check_output(
+                ['ps', '--ppid', pid, '-o', 'pid=']
+                ).decode().split()
+    except:
+        childs_pids = []
+
+    ret = childs_pids
+    for child_pid in childs_pids:
+        childs_childs_pids = get_childs_pids(child_pid)
+        ret.extend(childs_childs_pids)
+
+    return ret
+
+def pid_running(pid):
+    try:
+        subprocess.check_output(['ps', '--pid', '%s' % pid])
+        return True
+    except:
+        return False
+
+def best_effort_target_arrange(updated_targets, new_targets):
+    '''
+    Targets arrangement for kernels not supporting obsolete_target feature.
+
+    On the kernel, users cannot specify whether a target is obsolete.  Remove
+    those.  Also, DAMON will inherit monitoring results of targets of same
+    index.  Try to keep existing targets have same index as a best effort.
+    '''
+    for idx, old_target in enumerate(updated_targets):
+        if old_target.obsolete and len(new_targets) > 0:
+            updated_targets[idx] = new_targets[0]
+            new_targets = new_targets[1:]
+            # todo: the new target will unnecessarily inherit old target's
+            # monitoring results.  Avoid it if possible.
+    if len(new_targets) > 0:
+        return updated_targets + new_targets
+    # todo: try to further keep the index
+    return [t for t in updated_targets if t.obsolete is False]
+
+def add_vaddr_child_targets(ctx):
+    '''
+    Returns whether a change is made, and old targets list if a change was made
+    '''
+    if not target_has_pid(ctx.ops):
+        return False, None
+    if target_regions_fixed(ctx.ops):
+        return False, None
+
+    changes_made = False
+    orig_targets = ctx.targets
+    updated_targets = []
+    child_targets = []
+    for orig_target in orig_targets:
+        updated_targets.append(DamonTarget(pid=orig_target.pid, regions=[]))
+        if not pid_running(orig_target.pid):
+            updated_targets[-1].obsolete = True
+            changes_made = True
+        for child_pid in get_childs_pids('%s' % orig_target.pid):
+            child_targets.append(DamonTarget(pid=child_pid, regions=[]))
+            changes_made = True
+    if changes_made:
+        if feature_supported('obsolete_target'):
+            ctx.targets = updated_targets + child_targets
+        else:
+            ctx.targets = best_effort_target_arrange(
+                    updated_targets, child_targets)
+    return changes_made, orig_targets
+
+def add_commit_vaddr_child_targets(kdamonds):
+    need_commit = False
+    old_targets_list = []
+    for kd in kdamonds:
+        for ctx in kd.contexts:
+            ctx = kdamonds[0].contexts[0]
+            need_commit_, old_targets = add_vaddr_child_targets(ctx)
+            if need_commit_ is True:
+                need_commit = True
+            old_targets_list.append(old_targets)
+    if not need_commit:
+        return
+    err = commit(kdamonds, commit_targets_only=True)
+    if err is not None:
+        idx = 0
+        for kd in kdamonds:
+            for ctx in kd.contexts:
+                ctx.targets = old_targets[idx]
+                idx += 1
+        return 'commit failed (%s)' % err
 
     return None
 

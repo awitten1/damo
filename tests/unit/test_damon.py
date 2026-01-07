@@ -18,7 +18,7 @@ class TestDamon(unittest.TestCase):
         target_kvpairs = target.to_kvpairs()
         self.assertEqual(type(target_kvpairs), collections.OrderedDict)
         self.assertEqual(list(target_kvpairs.keys()),
-                ['pid', 'regions'])
+                ['pid', 'obsolete', 'regions'])
         self.assertEqual(target,
                 _damon.DamonTarget.from_kvpairs(target_kvpairs))
 
@@ -40,7 +40,8 @@ class TestDamon(unittest.TestCase):
                  'quotas', 'watermarks', 'filters', 'stats'])
         self.assertEqual(list(damos_kvpairs['stats'].keys()),
                 ['nr_tried', 'sz_tried', 'nr_applied', 'sz_applied',
-                 'sz_ops_filter_passed', 'qt_exceeds'])
+                 'sz_ops_filter_passed', 'qt_exceeds', 'nr_snapshots',
+                 'max_nr_snapshots'])
         self.assertEqual(damos, _damon.Damos.from_kvpairs(damos_kvpairs))
 
         ctx = _damon.DamonCtx('paddr', [target],
@@ -50,7 +51,8 @@ class TestDamon(unittest.TestCase):
         ctx_kvpairs = ctx.to_kvpairs()
         self.assertEqual(type(ctx_kvpairs), collections.OrderedDict)
         self.assertEqual(list(ctx_kvpairs.keys()),
-                ['ops', 'targets', 'intervals', 'nr_regions', 'schemes'])
+                ['ops', 'targets', 'intervals', 'nr_regions', 'sample_control',
+                 'schemes'])
         self.assertEqual(ctx, _damon.DamonCtx.from_kvpairs(ctx_kvpairs))
 
         kdamond = _damon.Kdamond('off', 123, [ctx])
@@ -338,6 +340,29 @@ class TestDamon(unittest.TestCase):
         age = _damon.DamonAge.from_kvpairs({'usec': 12, 'aggr_intervals': 456})
         self.assertEqual(age.usec, 12)
         self.assertEqual(age.aggr_intervals, 456)
+
+    def test_best_effort_target_arrange(self):
+        updated_targets = [
+                _damon.DamonTarget(pid=1),
+                _damon.DamonTarget(pid=2, obsolete=True),
+                _damon.DamonTarget(pid=3),
+                _damon.DamonTarget(pid=4, obsolete=True),
+                ]
+        new_targets = [
+                _damon.DamonTarget(pid=5),
+                _damon.DamonTarget(pid=6),
+                _damon.DamonTarget(pid=7),
+                ]
+        expect_targets = [
+                _damon.DamonTarget(pid=1),
+                _damon.DamonTarget(pid=5),
+                _damon.DamonTarget(pid=3),
+                _damon.DamonTarget(pid=6),
+                _damon.DamonTarget(pid=7),
+                ]
+        result_targets = _damon.best_effort_target_arrange(
+                updated_targets, new_targets)
+        self.assertEqual(result_targets, expect_targets)
 
 if __name__ == '__main__':
     unittest.main()

@@ -8,7 +8,9 @@ import os
 
 import _damo_deprecation_notice
 import _damo_fs
+import _damo_sysinfo
 import _damon
+import _damon_features
 
 debugfs_root = None
 
@@ -137,7 +139,7 @@ def write_schemes(dir_path, schemes, intervals):
     scheme_file_input_lines = []
     for scheme in schemes:
         scheme_file_input_lines.append(damos_to_debugfs_input(scheme,
-            intervals, feature_supported('schemes_quotas')))
+            intervals, feature_supported('schemes_time_quota')))
     scheme_file_input = '\n'.join(scheme_file_input_lines)
     if scheme_file_input == '':
         scheme_file_input = '\n'
@@ -319,13 +321,15 @@ def nr_kdamonds():
 
 # features
 
-feature_supports = None
-
-def feature_supported(feature):
-    if feature_supports == None:
-        update_supported_features()
-
-    return feature_supports[feature]
+def feature_supported(feature_name):
+    sysinfo, err = _damo_sysinfo.get_sysinfo()
+    if err is not None:
+        # this should be called after load_sysinfo() success.
+        raise Exception('BUG')
+    for feature in sysinfo.avail_damon_debugfs_features:
+        if feature.name == feature_name:
+            return True
+    return False
 
 def values_for_restore(filepath, read_val):
     if read_val == '':
@@ -421,14 +425,13 @@ def test_init_regions_version(paddr_supported):
 
     return version
 
-def update_supported_features():
-    global feature_supports
-    if feature_supports != None:
-        return None
-    feature_supports = {x: False for x in _damon.features}
+def mk_feature_supports_map():
+    '''
+    Returns feature supports info map and an error if failed.
+    Read _damon_sysfs.mk_feature_supports_map() for more details.
+    '''
 
-    if not os.path.isdir(get_damon_dir()):
-        return 'damon debugfs dir (%s) not found' % get_damon_dir()
+    feature_supports = {x.name: False for x in _damon_features.features_list}
 
     need_schemes_file_test = False
     if os.path.isfile(get_schemes_file()):
@@ -438,20 +441,21 @@ def update_supported_features():
         if nr_fields == 0:
             need_schemes_file_test = True
         elif nr_fields == 20:   # v5.16
-            feature_supports['schemes_speed_limit'] = True
+            feature_supports['schemes_size_quota'] = True
             feature_supports['schemes_prioritization'] = True
             feature_supports['schemes_wmarks'] = True
-            feature_supports['schemes_quotas'] = True
+            feature_supports['schemes_time_quota'] = True
         elif nr_fields == 23:   # v5.17 or later
-            feature_supports['schemes_speed_limit'] = True
+            feature_supports['schemes_size_quota'] = True
             feature_supports['schemes_prioritization'] = True
             feature_supports['schemes_wmarks'] = True
-            feature_supports['schemes_quotas'] = True
+            feature_supports['schemes_time_quota'] = True
             feature_supports['schemes_stat_succ'] = True
             feature_supports['schemes_stat_qt_exceed'] = True
 
     if _damon.any_kdamond_running():
-        return 'debugfs feature update cannot be done while DAMON running'
+        return None, \
+                'debugfs feature update cannot be done while DAMON running'
 
     # virtual address space has supported since the beginning
     feature_supports['vaddr'] = True
@@ -468,16 +472,16 @@ def update_supported_features():
     if need_schemes_file_test:
         # 'schemes' receives 18 numbers input and has three stats (v5.16)
         if test_debugfs_file_schemes(18):
-            feature_supports['schemes_speed_limit'] = True
+            feature_supports['schemes_size_quota'] = True
             feature_supports['schemes_prioritization'] = True
             feature_supports['schemes_wmarks'] = True
-            feature_supports['schemes_quotas'] = True
+            feature_supports['schemes_time_quota'] = True
         elif test_debugfs_file_schemes_stat_extended(18):
-            feature_supports['schemes_speed_limit'] = True
+            feature_supports['schemes_size_quota'] = True
             feature_supports['schemes_prioritization'] = True
             feature_supports['schemes_wmarks'] = True
-            feature_supports['schemes_quotas'] = True
+            feature_supports['schemes_time_quota'] = True
             feature_supports['schemes_stat_succ'] = True
             feature_supports['schemes_stat_qt_exceed'] = True
 
-    return None
+    return feature_supports, None

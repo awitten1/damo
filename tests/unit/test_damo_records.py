@@ -135,5 +135,98 @@ class TestDamon(unittest.TestCase):
                 _damo_records.parse_sort_bytes_ranges_input(
                     [[10, 20], [5, 7]]), ([[5, 7], [10, 20]], None))
 
+    def test_damon_trace_fields(self):
+        # trace-cmd report output
+        self.assertEqual(_damo_records.damon_trace_fields('cpus=8'), None)
+        self.assertEqual(_damo_records.damon_trace_fields(
+            '       kdamond.0-263515 [000] ..... 92566.021974: '
+            'damon_aggregated:     target_id=0 nr_regions=11 '
+            '4294967296-4701806592: 0 1635'),
+            ['92566.021974:', 'damon_aggregated:', 'target_id=0',
+             'nr_regions=11', '4294967296-4701806592:', '0', '1635'])
+        self.assertEqual(_damo_records.damon_trace_fields(
+            '       kdamond.0-263515 [000] ..... 92566.021974: '
+            'damon_aggregated:     target_id=0 nr_regions=11 '
+            '4294967296-4701806592: 0'),
+            ['92566.021974:', 'damon_aggregated:', 'target_id=0',
+             'nr_regions=11', '4294967296-4701806592:', '0'])
+
+        # perf script output
+        self.assertEqual(
+                _damo_records.damon_trace_fields(
+                    '        kthreadd  264573 [003] 93211.675342:'
+                    '             damon:damon_aggregated: target_id=0 '
+                    'nr_regions=2 4294967296-5518340096: 0'),
+                '93211.675342: damon:damon_aggregated: target_id=0 nr_regions=2 '
+                '4294967296-5518340096: 0'.split())
+
+    def test_parse_damon_trace_region(self):
+        # trace-cmd output
+        self.assertEqual(_damo_records.parse_damon_trace_region(
+            _damo_records.damon_trace_fields(
+                '       kdamond.0-48034 [007] .....  5435.406849: '
+                'damon_aggregated:     target_id=12 nr_regions=3 '
+                '4294967296-8372879360: 4 5')),
+            (_damon.DamonRegion(
+                start=4294967296, end=8372879360, nr_accesses=4,
+                nr_accesses_unit=_damon.unit_samples, age=5,
+                age_unit=_damon.unit_aggr_intervals), 5435406849000, 12, 3))
+        self.assertEqual(_damo_records.parse_damon_trace_region(
+            _damo_records.damon_trace_fields(
+                '       kdamond.0-48034 [007] .....  5435.406849: '
+                'damon_aggregated:     target_id=12 nr_regions=3 '
+                '4294967296-8372879360: 4')),
+            (_damon.DamonRegion(
+                start=4294967296, end=8372879360, nr_accesses=4,
+                nr_accesses_unit=_damon.unit_samples, age=None,
+                age_unit=_damon.unit_aggr_intervals), 5435406849000, 12, 3))
+
+        # perf-script output
+        self.assertEqual(_damo_records.parse_damon_trace_region(
+            _damo_records.damon_trace_fields(
+                '        kthreadd  264573 [002] 93214.744389:             '
+                'damon:damon_aggregated: target_id=12 nr_regions=10 '
+                '7473692672-8372879360: 3 4')),
+            (_damon.DamonRegion(
+                start=7473692672, end=8372879360, nr_accesses=3,
+                nr_accesses_unit=_damon.unit_samples, age=4,
+                age_unit=_damon.unit_aggr_intervals),
+             93214744389000, 12, 10))
+        self.assertEqual(_damo_records.parse_damon_trace_region(
+            _damo_records.damon_trace_fields(
+                '        kthreadd  264573 [002] 93214.744389:             '
+                'damon:damon_aggregated: target_id=12 nr_regions=10 '
+                '7473692672-8372879360: 3')),
+            (_damon.DamonRegion(
+                start=7473692672, end=8372879360, nr_accesses=3,
+                nr_accesses_unit=_damon.unit_samples, age=None,
+                age_unit=_damon.unit_aggr_intervals),
+             93214744389000, 12, 10))
+
+    def test_parse_damon_trace_intervals_tune(self):
+        self.assertEqual(_damo_records.parse_damon_trace_intervals_tune(
+            _damo_records.damon_trace_fields(
+                '       kdamond.0-48034 [007] .....  5435.619246: '
+                'damon_monitor_intervals_tune: sample_us=1234')),
+            (True, 1234))
+        self.assertEqual(_damo_records.parse_damon_trace_intervals_tune(
+            _damo_records.damon_trace_fields(
+                '       kdamond.0-48034 [007] .....  5435.406849: '
+                'damon_aggregated:     target_id=12 nr_regions=3 '
+                '4294967296-8372879360: 4 5')),
+            (False, None))
+
+        self.assertEqual(_damo_records.parse_damon_trace_intervals_tune(
+            _damo_records.damon_trace_fields(
+                '        kthreadd  264573 [003] 93211.464138: '
+                'damon:damon_monitor_intervals_tune: sample_us=1234')),
+            (True, 1234))
+        self.assertEqual(_damo_records.parse_damon_trace_intervals_tune(
+            _damo_records.damon_trace_fields(
+                '        kthreadd  264573 [002] 93214.744389:             '
+                'damon:damon_aggregated: target_id=12 nr_regions=10 '
+                '7473692672-8372879360: 3')),
+            (False, None))
+
 if __name__ == '__main__':
     unittest.main()

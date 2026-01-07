@@ -7,7 +7,7 @@ import os
 damo_dir = os.path.dirname(os.path.abspath(__file__))
 os.sys.path.insert(0, damo_dir)
 
-# on some distros, symlonk damo's directory is added to the os.sys.path,
+# on some distros, symlink damo's directory is added to the os.sys.path,
 # instead of the damo.py's directory.  In the case, using damo from local repo
 # fails.  Check the case and modify os.sys.path, accordingly.
 if not os.path.isfile(os.path.join(damo_dir, 'damo_version.py')):
@@ -38,9 +38,6 @@ import damo_tune
 import damo_validate
 import damo_version
 
-def pr_damo_version(args_not_use):
-    print(damo_version.__version__)
-
 subcmds = [
         # DAMON control
         _damo_subcmds.DamoSubCmd(name='start', module=damo_start,
@@ -54,7 +51,7 @@ subcmds = [
         _damo_subcmds.DamoSubCmd(name='record', module=damo_record,
             msg='record data accesses and additional information'),
         _damo_subcmds.DamoSubCmd(name='report', module=damo_report,
-            msg='visualize the \'record\'-generated or snapshot data'),
+            msg='visualize damo-generated data'),
         _damo_subcmds.DamoSubCmd(name='replay', module=damo_replay,
             msg='replay the recorded data accesses'),
 
@@ -73,8 +70,8 @@ subcmds = [
         _damo_subcmds.DamoSubCmd(name='args',
             module=damo_args,
             msg='generate complex arguments for other commands'),
-        _damo_subcmds.DamoSubCmd(name='version',
-            module=_damo_subcmds.DamoSubCmdModule(None, pr_damo_version),
+        _damo_subcmds.DamoSubCmd(
+            name='version', module=damo_version,
             msg='print the version number'),
         _damo_subcmds.DamoSubCmd(name='schemes', module=damo_schemes,
             msg='apply operation schemes'),
@@ -85,7 +82,8 @@ subcmds = [
         _damo_subcmds.DamoSubCmd(name='validate', module=damo_validate,
             msg='validate a given record result file'),
         _damo_subcmds.DamoSubCmd(name='adjust', module=damo_adjust,
-            msg='adjust the record results with different monitoring attributes'),
+            msg='adjust the record results with filters and ' \
+                                 'different monitoring attributes'),
         _damo_subcmds.DamoSubCmd(name='convert_record_format',
             module=damo_convert_record_format,
             msg='convert DAMON result record file\'s format'),
